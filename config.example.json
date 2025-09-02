@@ -1,0 +1,63 @@
+{
+  "timelapses": [
+    {
+      "slug": "example_region",
+      "name": "Example Region",
+      "description": "Example timelapse configuration for a small region",
+      "coordinates": {
+        "xmin": 1000,
+        "xmax": 1002,
+        "ymin": 800,
+        "ymax": 802
+      },
+      "enabled": true,
+      "timelapse_modes": {
+        "normal": {
+          "enabled": true,
+          "suffix": ""
+        },
+        "diff": {
+          "enabled": true,
+          "suffix": "_diff"
+        }
+      }
+    },
+    {
+      "slug": "larger_area",
+      "name": "Larger Area Example",
+      "description": "Example configuration for monitoring a larger region",
+      "coordinates": {
+        "xmin": 1200,
+        "xmax": 1210,
+        "ymin": 850,
+        "ymax": 860
+      },
+      "enabled": false,
+      "timelapse_modes": {
+        "normal": {
+          "enabled": true,
+          "suffix": ""
+        },
+        "diff": {
+          "enabled": false,
+          "suffix": "_diff"
+        }
+      }
+    }
+  ],
+  "global_settings": {
+    "base_url": "https://backend.wplace.live/files/s0/tiles",
+    "backup_interval_minutes": 5,
+    "backup_dir": "backups",
+    "output_dir": "output",
+    "request_delay": 0.5,
+    "timelapse_fps": 10,
+    "timelapse_quality": 23,
+    "diff_settings": {
+      "threshold": 10,
+      "visualization": "colored",
+      "fade_frames": 3,
+      "enhancement_factor": 2.0
+    }
+  }
+}

@@ -1,0 +1,12 @@
+[project]
+name = "wplace-timelapse"
+version = "0.1.0"
+description = "Get tiles from wplace.live at regular intervals and generate timelapse video"
+requires-python = ">=3.13"
+dependencies = [
+    "apscheduler>=3.11.0",
+    "opencv-python>=4.12.0.88",
+    "pillow>=11.3.0",
+    "python-dotenv>=1.1.1",
+    "requests>=2.32.5",
+]
