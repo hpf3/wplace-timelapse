@@ -13,3 +13,4 @@ wheels/
 backup*
 output*
 *.log
+config.json
