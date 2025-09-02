@@ -4,7 +4,7 @@ A Python-based automated system that creates timelapse videos from [WPlace](http
 
 ## Features
 
-- **Multi-Location Monitoring**: Track multiple regions simultaneously (Gaza, Toulouse, Buenos Aires, etc.)
+- **Multi-Location Monitoring**: Track multiple regions simultaneously (Toulouse, Buenos Aires, etc.)
 - **Automated Collection**: Downloads tiles every 5 minutes with configurable intervals
 - **Dual Timelapse Modes**:
   - **Normal Mode**: Standard timelapse showing full canvas evolution
@@ -17,8 +17,8 @@ A Python-based automated system that creates timelapse videos from [WPlace](http
 ## Sample Output
 
 ### Normal Timelapse
-![Gaza Sample](images/gaza_sample.png)
-*Gaza region timelapse showing collaborative pixel art evolution*
+![Toulouse](images/toulouse_normal.png)
+*Toulouse region timelapse showing collaborative pixel art evolution*
 
 ### Normal vs Differential Comparison
 | Normal Mode | Differential Mode |
@@ -81,14 +81,14 @@ The system uses `config.json` for configuration. Here's the structure:
 {
   "timelapses": [
     {
-      "slug": "gaza",
-      "name": "Gaza",
-      "description": "Gaza region monitoring",
+      "slug": "toulouse",
+      "name": "Toulouse",
+      "description": "Toulouse region monitoring",
       "coordinates": {
-        "xmin": 1214,
-        "xmax": 1220,
-        "ymin": 832,
-        "ymax": 837
+        "xmin": 1031,
+        "xmax": 1032,
+        "ymin": 747,
+        "ymax": 748
       },
       "enabled": true,
       "timelapse_modes": {
@@ -126,16 +126,16 @@ The system uses `config.json` for configuration. Here's the structure:
 
 ```
 output/
-├── gaza/
+├── toulouse/
 │   ├── 2025-09-01.mp4      # Normal timelapse
 │   ├── 2025-09-01_diff.mp4 # Differential timelapse
 │   └── 2025-09-02.mp4
-├── toulouse/
+├── other/
 │   └── ...
 └── ...
 
 backups/
-├── gaza/
+├── toulouse/
 │   └── 2025-09-01/
 │       ├── 12-00-00/       # Hour-minute-second
 │       │   ├── 1214_832.png
@@ -178,7 +178,6 @@ Advanced mode that highlights only the pixels that changed between frames:
 
 The default configuration includes three interesting regions:
 
-- **Gaza**: High activity region with frequent changes
 - **Toulouse**: European city with moderate activity  
 - **Buenos Aires**: South American region with varied artwork
 
