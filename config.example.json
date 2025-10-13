@@ -53,6 +53,7 @@
     "request_delay": 0.5,
     "timelapse_fps": 10,
     "timelapse_quality": 23,
+    "background_color": [0, 0, 0],
     "diff_settings": {
       "threshold": 10,
       "visualization": "colored",

@@ -51,6 +51,7 @@ class TimelapseBackup:
             self.request_delay = settings.get('request_delay', 0.5)
             self.fps = settings.get('timelapse_fps', 10)
             self.quality = settings.get('timelapse_quality', 23)
+            self.background_color = self._parse_background_color(settings.get('background_color', [0, 0, 0]))
             
             # Differential settings
             diff_settings = settings.get('diff_settings', {})
@@ -69,6 +70,7 @@ class TimelapseBackup:
             self.request_delay = float(os.getenv('REQUEST_DELAY', 0.5))
             self.fps = int(os.getenv('TIMELAPSE_FPS', 10))
             self.quality = int(os.getenv('TIMELAPSE_QUALITY', 23))
+            self.background_color = (0, 0, 0)
             
             # Differential settings (defaults)
             self.diff_threshold = 10
@@ -96,9 +98,38 @@ class TimelapseBackup:
                     'output_dir': str(self.output_dir),
                     'request_delay': self.request_delay,
                     'timelapse_fps': self.fps,
-                    'timelapse_quality': self.quality
+                    'timelapse_quality': self.quality,
+                    'background_color': list(self.background_color)
                 }
             }
+
+    def _parse_background_color(self, value: Any) -> Tuple[int, int, int]:
+        """Parse and clamp background color definition"""
+        default = (0, 0, 0)
+
+        if isinstance(value, (list, tuple)) and len(value) == 3:
+            try:
+                color = tuple(
+                    max(0, min(255, int(channel)))
+                    for channel in value
+                )
+                return color
+            except (TypeError, ValueError):
+                return default
+
+        if isinstance(value, str):
+            hex_value = value.lstrip('#')
+            if len(hex_value) == 6:
+                try:
+                    r = int(hex_value[0:2], 16)
+                    g = int(hex_value[2:4], 16)
+                    b = int(hex_value[4:6], 16)
+                    # Convert from RGB string to BGR tuple used by OpenCV
+                    return (b, g, r)
+                except ValueError:
+                    return default
+
+        return default
     
     def get_enabled_timelapses(self) -> List[Dict[str, Any]]:
         """Get list of enabled timelapse configurations"""
@@ -222,7 +253,11 @@ class TimelapseBackup:
         # Create composite image
         composite_height = len(y_coords) * tile_height
         composite_width = len(x_coords) * tile_width
-        composite = np.zeros((composite_height, composite_width, 3), dtype=np.uint8)
+        composite = np.full(
+            (composite_height, composite_width, 3),
+            self.background_color,
+            dtype=np.uint8
+        )
         
         for x, y in coordinates:
             filepath = session_dir / f"{x}_{y}.png"
@@ -249,8 +284,8 @@ class TimelapseBackup:
     def create_differential_frame(self, prev_frame: np.ndarray, curr_frame: np.ndarray) -> np.ndarray:
         """Create differential frame showing changes between two frames"""
         if prev_frame is None:
-            # First frame - return black image
-            return np.zeros_like(curr_frame)
+            # First frame - return configured background color
+            return np.full_like(curr_frame, self.background_color)
             
         # Calculate absolute difference
         diff = cv2.absdiff(prev_frame, curr_frame)
