@@ -13,7 +13,7 @@ import time
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -23,6 +23,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 load_dotenv()
 
 class TimelapseBackup:
+    PLACEHOLDER_SUFFIX = '.placeholder'
+
     def __init__(self, config_file: str = 'config.json'):
         self.config_file = config_file
         self.config = self.load_configuration()
@@ -156,26 +158,178 @@ class TimelapseBackup:
             for y in range(coords['ymin'], coords['ymax'] + 1):
                 coordinates.append((x, y))
         return coordinates
+    
+    def _placeholder_filename(self, filename: str) -> str:
+        """Derive placeholder filename for a tile"""
+        return f"{Path(filename).stem}{self.PLACEHOLDER_SUFFIX}"
+
+    def _placeholder_path(self, session_dir: Path, filename: str) -> Path:
+        """Return path to placeholder file for given tile filename"""
+        return session_dir / self._placeholder_filename(filename)
+
+    def _write_placeholder(self, placeholder_path: Path, target_path: Path) -> bool:
+        """Create placeholder metadata referencing target tile path"""
+        data = {
+            "type": "placeholder",
+            "target": str(target_path.resolve()),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        try:
+            with open(placeholder_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            return True
+        except OSError as exc:
+            self.logger.error(f"Failed to write placeholder {placeholder_path}: {exc}")
+            return False
+
+    def _read_placeholder_target(self, placeholder_path: Path) -> Optional[Path]:
+        """Read target path from placeholder metadata"""
+        try:
+            with open(placeholder_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            target = data.get("target")
+            if target:
+                return Path(target)
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            self.logger.warning(f"Invalid placeholder file {placeholder_path}: {exc}")
+        return None
+
+    def _parse_session_datetime(self, session_dir: Path) -> Optional[datetime]:
+        """Parse datetime from session directory path"""
+        try:
+            return datetime.strptime(
+                f"{session_dir.parent.name} {session_dir.name}",
+                "%Y-%m-%d %H-%M-%S"
+            )
+        except ValueError:
+            return None
+
+    def get_prior_sessions(self, slug: str, current_session: Path) -> List[Path]:
+        """Get list of prior session directories ordered from newest to oldest"""
+        slug_dir = self.backup_dir / slug
+        if not slug_dir.exists():
+            return []
+
+        current_dt = self._parse_session_datetime(current_session)
+        sessions: List[Tuple[datetime, Path]] = []
+
+        for date_dir in slug_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+            for time_dir in date_dir.iterdir():
+                if not time_dir.is_dir() or time_dir == current_session:
+                    continue
+                session_dt = self._parse_session_datetime(time_dir)
+                if session_dt is None:
+                    continue
+                if current_dt is not None and session_dt >= current_dt:
+                    continue
+                sessions.append((session_dt, time_dir))
+
+        sessions.sort(key=lambda item: item[0], reverse=True)
+        return [path for _, path in sessions]
+
+    def build_previous_tile_map(
+        self,
+        prior_sessions: List[Path],
+        coordinates: List[Tuple[int, int]]
+    ) -> Dict[str, Path]:
+        """
+        Build map of tile filename to the most recent available PNG path from prior sessions.
+        """
+        filenames = {f"{x}_{y}.png" for x, y in coordinates}
+        result: Dict[str, Path] = {}
+
+        for session_dir in prior_sessions:
+            remaining = filenames.difference(result.keys())
+            if not remaining:
+                break
+
+            for filename in list(remaining):
+                direct_path = session_dir / filename
+                if direct_path.exists():
+                    result[filename] = direct_path
+                    continue
+
+                placeholder_path = self._placeholder_path(session_dir, filename)
+                if placeholder_path.exists():
+                    target_path = self._read_placeholder_target(placeholder_path)
+                    if target_path and target_path.exists():
+                        result[filename] = target_path
+
+        return result
+
+    def resolve_tile_image_path(self, session_dir: Path, x: int, y: int) -> Optional[Path]:
+        """Resolve actual image path for a tile, following placeholders if needed"""
+        filename = f"{x}_{y}.png"
+        candidate = session_dir / filename
+        if candidate.exists():
+            return candidate
+
+        placeholder_path = self._placeholder_path(session_dir, filename)
+        if placeholder_path.exists():
+            target = self._read_placeholder_target(placeholder_path)
+            if target and target.exists():
+                return target
+            if target and not target.exists():
+                self.logger.warning(f"Placeholder target missing for {placeholder_path}: {target}")
+
+        return None
         
-    def download_tile(self, x: int, y: int, session_dir: Path) -> bool:
-        """Download a single tile image"""
+    def download_tile(
+        self,
+        slug: str,
+        x: int,
+        y: int,
+        session_dir: Path,
+        previous_tile_map: Dict[str, Path]
+    ) -> Tuple[bool, bool]:
+        """Download a single tile image and skip duplicates via placeholders.
+
+        Returns:
+            Tuple[bool, bool]: (success flag, placeholder created flag)
+        """
         try:
             url = f"{self.base_url}/{x}/{y}.png"
             filename = f"{x}_{y}.png"
             filepath = session_dir / filename
-            
+
             response = requests.get(url, timeout=10)
             response.raise_for_status()
-            
+
+            content = response.content
+            previous_path = previous_tile_map.get(filename)
+
+            if previous_path and previous_path.exists():
+                try:
+                    if previous_path.read_bytes() == content:
+                        placeholder_path = self._placeholder_path(session_dir, filename)
+                        if self._write_placeholder(placeholder_path, previous_path):
+                            self.logger.debug(
+                                f"Skipped duplicate tile {slug} {x},{y}; placeholder -> {previous_path}"
+                            )
+                            return True, True
+                        else:
+                            self.logger.debug(
+                                f"Placeholder creation failed for {slug} {x},{y}; saving tile to disk"
+                            )
+                except OSError as exc:
+                    self.logger.warning(f"Failed to read previous tile {previous_path}: {exc}")
+
             with open(filepath, 'wb') as f:
-                f.write(response.content)
-                
-            self.logger.debug(f"Downloaded tile {x},{y} to {filepath}")
-            return True
-            
+                f.write(content)
+
+            # Ensure no stale placeholder remains
+            placeholder_path = self._placeholder_path(session_dir, filename)
+            if placeholder_path.exists():
+                placeholder_path.unlink(missing_ok=True)
+
+            self.logger.debug(f"Downloaded tile {slug} {x},{y} to {filepath}")
+            return True, False
+
         except Exception as e:
             self.logger.error(f"Failed to download tile {x},{y}: {e}")
-            return False
+            return False, False
             
     def backup_tiles(self):
         """Backup all tiles for current timestamp for all enabled timelapses"""
@@ -188,6 +342,7 @@ class TimelapseBackup:
         
         total_successful = 0
         total_tiles = 0
+        total_duplicates = 0
         
         for timelapse in enabled_timelapses:
             slug = timelapse['slug']
@@ -198,22 +353,41 @@ class TimelapseBackup:
             session_dir.mkdir(parents=True, exist_ok=True)
             
             coordinates = self.get_tile_coordinates(timelapse)
+            prior_sessions = self.get_prior_sessions(slug, session_dir)
+            previous_tile_map = self.build_previous_tile_map(prior_sessions, coordinates)
             successful_downloads = 0
-            
+            duplicate_tiles = 0
+
             self.logger.info(f"Backing up '{name}' ({slug}): {len(coordinates)} tiles")
             
             for i, (x, y) in enumerate(coordinates):
-                if self.download_tile(x, y, session_dir):
+                success, used_placeholder = self.download_tile(
+                    slug,
+                    x,
+                    y,
+                    session_dir,
+                    previous_tile_map
+                )
+                if success:
                     successful_downloads += 1
+                    if used_placeholder:
+                        duplicate_tiles += 1
                 
                 # Add delay between requests (except for the last one)
                 if i < len(coordinates) - 1:
                     time.sleep(self.request_delay)
                     
-            self.logger.info(f"'{name}' completed: {successful_downloads}/{len(coordinates)} tiles")
+            if duplicate_tiles:
+                self.logger.info(
+                    f"'{name}' completed: {successful_downloads}/{len(coordinates)} tiles "
+                    f"({duplicate_tiles} duplicates skipped)"
+                )
+            else:
+                self.logger.info(f"'{name}' completed: {successful_downloads}/{len(coordinates)} tiles")
             
             total_successful += successful_downloads
             total_tiles += len(coordinates)
+            total_duplicates += duplicate_tiles
             
             # Remove empty session directory if no downloads succeeded
             if successful_downloads == 0:
@@ -227,7 +401,15 @@ class TimelapseBackup:
                 except:
                     pass
                     
-        self.logger.info(f"Backup session completed: {total_successful}/{total_tiles} total tiles downloaded")
+        if total_duplicates:
+            self.logger.info(
+                f"Backup session completed: {total_successful}/{total_tiles} total tiles processed "
+                f"({total_duplicates} duplicates skipped)"
+            )
+        else:
+            self.logger.info(
+                f"Backup session completed: {total_successful}/{total_tiles} total tiles downloaded"
+            )
                 
     def create_composite_image(self, session_dir: Path, timelapse_config: Dict[str, Any]) -> np.ndarray:
         """Create a composite image from individual tiles"""
@@ -240,11 +422,12 @@ class TimelapseBackup:
         # Load first image to get tile dimensions
         first_tile = None
         for x, y in coordinates:
-            filepath = session_dir / f"{x}_{y}.png"
-            if filepath.exists():
-                first_tile = cv2.imread(str(filepath))
-                break
-                
+            tile_path = self.resolve_tile_image_path(session_dir, x, y)
+            if tile_path:
+                first_tile = cv2.imread(str(tile_path))
+                if first_tile is not None:
+                    break
+
         if first_tile is None:
             return None
             
@@ -260,11 +443,11 @@ class TimelapseBackup:
         )
         
         for x, y in coordinates:
-            filepath = session_dir / f"{x}_{y}.png"
-            if not filepath.exists():
+            tile_path = self.resolve_tile_image_path(session_dir, x, y)
+            if not tile_path:
                 continue
-                
-            tile = cv2.imread(str(filepath))
+
+            tile = cv2.imread(str(tile_path))
             if tile is None:
                 continue
                 
