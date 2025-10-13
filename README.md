@@ -121,8 +121,10 @@ The system uses `config.json` for configuration. Here's the structure:
 - **coordinates**: Define the tile region to monitor (x/y tile coordinates)
 - **backup_interval_minutes**: How often to download tiles (default: 5 minutes)
 - **timelapse_fps**: Frames per second for output videos (default: 10)
-- **background_color**: BGR color used to fill empty areas or missing tiles (default: `[0, 0, 0]`)
+- **background_color**: Base color (RGB array, hex string, or `{"value": [...], "order": "bgr"}`) used to fill empty areas or missing tiles (default: `[0, 0, 0]`)
 - **diff_settings**: Controls differential timelapse appearance and sensitivity
+
+Numeric arrays are interpreted as `[R, G, B]` for readability. Use a hex string (for example `"#2596BE"`) or wrap values as `{"value": [B, G, R], "order": "bgr"}` if you need to specify explicit BGR ordering.
 
 ## Output Structure
 

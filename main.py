@@ -109,15 +109,45 @@ class TimelapseBackup:
         """Parse and clamp background color definition"""
         default = (0, 0, 0)
 
-        if isinstance(value, (list, tuple)) and len(value) == 3:
+        def _clamp_triplet(triplet: Any) -> Optional[Tuple[int, int, int]]:
+            if not isinstance(triplet, (list, tuple)) or len(triplet) != 3:
+                return None
             try:
-                color = tuple(
+                return tuple(
                     max(0, min(255, int(channel)))
-                    for channel in value
+                    for channel in triplet
                 )
-                return color
             except (TypeError, ValueError):
+                return None
+
+        def _to_bgr(channels: Tuple[int, int, int], order: Optional[str]) -> Optional[Tuple[int, int, int]]:
+            color_order = (order or 'rgb').lower()
+            if color_order == 'bgr':
+                return channels
+            if color_order == 'rgb':
+                return (channels[2], channels[1], channels[0])
+            return None
+
+        if isinstance(value, dict):
+            if 'hex' in value and isinstance(value['hex'], str):
+                return self._parse_background_color(value['hex'])
+            if 'value' in value:
+                channels = _clamp_triplet(value['value'])
+                if channels is None:
+                    return default
+                bgr = _to_bgr(channels, value.get('order') or value.get('color_space'))
+                if bgr is not None:
+                    return bgr
                 return default
+
+        if isinstance(value, (list, tuple)):
+            channels = _clamp_triplet(value)
+            if channels is None:
+                return default
+            bgr = _to_bgr(channels, 'rgb')
+            if bgr is not None:
+                return bgr
+            return default
 
         if isinstance(value, str):
             hex_value = value.lstrip('#')
@@ -424,7 +454,11 @@ class TimelapseBackup:
         for x, y in coordinates:
             tile_path = self.resolve_tile_image_path(session_dir, x, y)
             if tile_path:
-                first_tile = cv2.imread(str(tile_path))
+                first_tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
+                if first_tile is not None and len(first_tile.shape) == 2:
+                    first_tile = cv2.cvtColor(first_tile, cv2.COLOR_GRAY2BGR)
+                elif first_tile is not None and first_tile.shape[2] == 1:
+                    first_tile = cv2.cvtColor(first_tile, cv2.COLOR_GRAY2BGR)
                 if first_tile is not None:
                     break
 
@@ -447,10 +481,12 @@ class TimelapseBackup:
             if not tile_path:
                 continue
 
-            tile = cv2.imread(str(tile_path))
+            tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
             if tile is None:
                 continue
-                
+            if len(tile.shape) == 2 or tile.shape[2] == 1:
+                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+            
             # Calculate position in composite
             x_idx = x_coords.index(x)
             y_idx = y_coords.index(y)
@@ -459,8 +495,16 @@ class TimelapseBackup:
             end_y = start_y + tile_height
             start_x = x_idx * tile_width
             end_x = start_x + tile_width
-            
-            composite[start_y:end_y, start_x:end_x] = tile
+            region = composite[start_y:end_y, start_x:end_x]
+
+            if tile.shape[2] == 4:
+                # Preserve transparency: blend tile over the background
+                alpha = (tile[:, :, 3:4].astype(np.float32) / 255.0)
+                tile_rgb = tile[:, :, :3].astype(np.float32)
+                blended = tile_rgb * alpha + region.astype(np.float32) * (1.0 - alpha)
+                composite[start_y:end_y, start_x:end_x] = blended.astype(np.uint8)
+            else:
+                composite[start_y:end_y, start_x:end_x] = tile
             
         return composite
         
@@ -472,12 +516,15 @@ class TimelapseBackup:
             
         # Calculate absolute difference
         diff = cv2.absdiff(prev_frame, curr_frame)
+        background = np.full_like(curr_frame, self.background_color)
         
         if self.diff_visualization == 'binary':
             # Binary difference: white changes on black background
             gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             _, binary_diff = cv2.threshold(gray_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-            return cv2.cvtColor(binary_diff, cv2.COLOR_GRAY2BGR)
+            result = background.copy()
+            result[binary_diff > 0] = (255, 255, 255)
+            return result
             
         elif self.diff_visualization == 'heatmap':
             # Heatmap: color-coded intensity of changes
@@ -489,7 +536,10 @@ class TimelapseBackup:
             enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
             # Apply colormap (COLORMAP_JET for blue->red heatmap)
             heatmap = cv2.applyColorMap(enhanced, cv2.COLORMAP_JET)
-            return heatmap
+            result = background.copy()
+            mask = thresholded > 0
+            result[mask] = heatmap[mask]
+            return result
             
         elif self.diff_visualization == 'overlay':
             # Overlay: changes highlighted on semi-transparent background
@@ -522,11 +572,16 @@ class TimelapseBackup:
             enhanced_diff = cv2.multiply(colored_diff, self.diff_enhancement_factor)
             enhanced_diff = np.clip(enhanced_diff, 0, 255).astype(np.uint8)
             
-            return enhanced_diff
+            result = background.copy()
+            result[mask > 0] = enhanced_diff[mask > 0]
+            return result
             
         else:
             # Default to absolute difference
-            return diff
+            result = background.copy()
+            diff_mask = np.any(diff > 0, axis=2)
+            result[diff_mask] = diff[diff_mask]
+            return result
     
     def get_enabled_timelapse_modes(self, timelapse_config: Dict[str, Any]) -> List[Tuple[str, str]]:
         """Get list of enabled timelapse modes for a timelapse"""
