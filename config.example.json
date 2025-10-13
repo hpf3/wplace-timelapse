@@ -14,11 +14,13 @@
       "timelapse_modes": {
         "normal": {
           "enabled": true,
-          "suffix": ""
+          "suffix": "",
+          "create_full_timelapse": true
         },
         "diff": {
           "enabled": true,
-          "suffix": "_diff"
+          "suffix": "_diff",
+          "create_full_timelapse": false
         }
       }
     },
@@ -36,11 +38,13 @@
       "timelapse_modes": {
         "normal": {
           "enabled": true,
-          "suffix": ""
+          "suffix": "",
+          "create_full_timelapse": false
         },
         "diff": {
           "enabled": false,
-          "suffix": "_diff"
+          "suffix": "_diff",
+          "create_full_timelapse": false
         }
       }
     }

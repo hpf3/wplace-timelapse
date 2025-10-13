@@ -583,19 +583,165 @@ class TimelapseBackup:
             result[diff_mask] = diff[diff_mask]
             return result
     
-    def get_enabled_timelapse_modes(self, timelapse_config: Dict[str, Any]) -> List[Tuple[str, str]]:
+    def get_enabled_timelapse_modes(self, timelapse_config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Get list of enabled timelapse modes for a timelapse"""
         modes = timelapse_config.get('timelapse_modes', {
             'normal': {'enabled': True, 'suffix': ''}
         })
         
-        enabled_modes = []
+        enabled_modes: List[Dict[str, Any]] = []
         for mode_name, mode_config in modes.items():
             if mode_config.get('enabled', True):
                 suffix = mode_config.get('suffix', f'_{mode_name}' if mode_name != 'normal' else '')
-                enabled_modes.append((mode_name, suffix))
+                enabled_modes.append({
+                    'mode': mode_name,
+                    'suffix': suffix,
+                    'create_full': mode_config.get('create_full_timelapse', False)
+                })
                 
         return enabled_modes
+
+    def get_session_dirs_for_date(self, slug: str, date_str: str) -> List[Path]:
+        """Return session directories for a specific date ordered chronologically"""
+        date_dir = self.backup_dir / slug / date_str
+        if not date_dir.exists():
+            return []
+
+        sessions: List[Tuple[datetime, Path]] = []
+        for session_dir in date_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            session_dt = self._parse_session_datetime(session_dir)
+            if session_dt is None:
+                continue
+            sessions.append((session_dt, session_dir))
+
+        sessions.sort(key=lambda item: item[0])
+        return [path for _, path in sessions]
+
+    def get_all_sessions(self, slug: str) -> List[Path]:
+        """Collect all available session directories for a timelapse ordered chronologically"""
+        slug_dir = self.backup_dir / slug
+        if not slug_dir.exists():
+            return []
+
+        sessions: List[Tuple[datetime, Path]] = []
+        for date_dir in slug_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+            for session_dir in date_dir.iterdir():
+                if not session_dir.is_dir():
+                    continue
+                session_dt = self._parse_session_datetime(session_dir)
+                if session_dt is None:
+                    continue
+                sessions.append((session_dt, session_dir))
+
+        sessions.sort(key=lambda item: item[0])
+        return [path for _, path in sessions]
+
+    def render_timelapse_from_sessions(
+        self,
+        slug: str,
+        name: str,
+        timelapse_config: Dict[str, Any],
+        session_dirs: List[Path],
+        mode_name: str,
+        suffix: str,
+        output_filename: str,
+        label: str
+    ):
+        """Create timelapse from a pre-collected list of session directories"""
+        if not session_dirs:
+            self.logger.warning(
+                f"No session directories found for '{name}' ({slug}) {label}"
+            )
+            return
+
+        self.logger.info(
+            f"Creating {mode_name} timelapse for '{name}' ({slug}) {label} with {len(session_dirs)} frames"
+        )
+
+        safe_label = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in label)
+        temp_dir = Path(f"temp_timelapse_{slug}_{safe_label}_{mode_name}")
+        temp_dir.mkdir(exist_ok=True)
+
+        try:
+            valid_frames = 0
+            prev_composite = None
+
+            for i, session_dir in enumerate(session_dirs):
+                composite = self.create_composite_image(session_dir, timelapse_config)
+                if composite is None:
+                    continue
+
+                frame_path = temp_dir / f"frame_{i:06d}.png"
+                if mode_name == 'diff':
+                    diff_frame = self.create_differential_frame(prev_composite, composite)
+                    cv2.imwrite(str(frame_path), diff_frame)
+                    prev_composite = composite
+                else:
+                    cv2.imwrite(str(frame_path), composite)
+
+                valid_frames += 1
+
+            if valid_frames == 0:
+                self.logger.error(
+                    f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+                )
+                return
+
+            output_dir = self.output_dir / slug
+            output_dir.mkdir(exist_ok=True)
+
+            output_path = output_dir / output_filename
+
+            first_frame_idx = min(
+                (i for i, session_dir in enumerate(session_dirs) if (temp_dir / f"frame_{i:06d}.png").exists()),
+                default=None
+            )
+            if first_frame_idx is None:
+                self.logger.error(
+                    f"No frame files found for '{name}' ({slug}) {mode_name} {label}"
+                )
+                return
+
+            first_frame = cv2.imread(str(temp_dir / f"frame_{first_frame_idx:06d}.png"))
+            if first_frame is None:
+                self.logger.error(
+                    f"Failed to read first frame for '{name}' ({slug}) {mode_name} {label}"
+                )
+                return
+
+            height, width = first_frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(
+                str(output_path),
+                fourcc,
+                self.fps,
+                (width, height)
+            )
+
+            try:
+                for i in range(len(session_dirs)):
+                    frame_path = temp_dir / f"frame_{i:06d}.png"
+                    if not frame_path.exists():
+                        continue
+                    frame = cv2.imread(str(frame_path))
+                    if frame is None:
+                        continue
+                    video_writer.write(frame)
+            finally:
+                video_writer.release()
+
+            self.logger.info(
+                f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({valid_frames} frames)"
+            )
+
+        finally:
+            for file in temp_dir.glob("*.png"):
+                file.unlink()
+            temp_dir.rmdir()
         
     def create_daily_timelapse(self, date: datetime = None):
         """Create timelapse videos from previous day's images for all timelapses"""
@@ -611,95 +757,81 @@ class TimelapseBackup:
             slug = timelapse['slug']
             name = timelapse['name']
             
-            # Get enabled modes for this timelapse
             enabled_modes = self.get_enabled_timelapse_modes(timelapse)
+            session_dirs = self.get_session_dirs_for_date(slug, date_str)
+
+            for mode in enabled_modes:
+                mode_name = mode['mode']
+                suffix = mode['suffix']
+                label = f"on {date_str}"
+                output_filename = f"{date_str}{suffix}.mp4"
+
+                self.render_timelapse_from_sessions(
+                    slug,
+                    name,
+                    timelapse,
+                    session_dirs,
+                    mode_name,
+                    suffix,
+                    output_filename,
+                    label
+                )
+
+                if mode.get('create_full'):
+                    full_session_dirs = self.get_all_sessions(slug)
+                    self.render_timelapse_from_sessions(
+                        slug,
+                        name,
+                        timelapse,
+                        full_session_dirs,
+                        mode_name,
+                        suffix,
+                        f"full{suffix}.mp4",
+                        "across all backups"
+                    )
             
-            for mode_name, suffix in enabled_modes:
-                self.create_timelapse_for_slug(slug, name, timelapse, date_str, mode_name, suffix)
+    def create_full_timelapses(self):
+        """Create full-history timelapses for modes configured to support them"""
+        enabled_timelapses = self.get_enabled_timelapses()
+        self.logger.info(f"Creating full-history timelapses for {len(enabled_timelapses)} timelapses")
+
+        for timelapse in enabled_timelapses:
+            slug = timelapse['slug']
+            name = timelapse['name']
+
+            enabled_modes = [
+                mode for mode in self.get_enabled_timelapse_modes(timelapse)
+                if mode.get('create_full')
+            ]
+            if not enabled_modes:
+                continue
+
+            session_dirs = self.get_all_sessions(slug)
+            for mode in enabled_modes:
+                self.render_timelapse_from_sessions(
+                    slug,
+                    name,
+                    timelapse,
+                    session_dirs,
+                    mode['mode'],
+                    mode['suffix'],
+                    f"full{mode['suffix']}.mp4",
+                    "across all backups"
+                )
             
     def create_timelapse_for_slug(self, slug: str, name: str, timelapse_config: Dict[str, Any], date_str: str, mode_name: str = 'normal', suffix: str = ''):
         """Create timelapse video for a specific timelapse slug and mode"""
-        date_dir = self.backup_dir / slug / date_str
-        
-        if not date_dir.exists():
-            self.logger.warning(f"No backup data found for '{name}' ({slug}) on {date_str}")
-            return
-            
-        # Get all session directories for the date
-        session_dirs = sorted([d for d in date_dir.iterdir() if d.is_dir()])
-        
-        if not session_dirs:
-            self.logger.warning(f"No session directories found for '{name}' ({slug}) on {date_str}")
-            return
-            
-        self.logger.info(f"Creating {mode_name} timelapse for '{name}' ({slug}) on {date_str} with {len(session_dirs)} frames")
-        
-        # Create temporary directory for composite images
-        temp_dir = Path(f"temp_timelapse_{slug}_{date_str}_{mode_name}")
-        temp_dir.mkdir(exist_ok=True)
-        
-        try:
-            # Create composite images
-            valid_frames = 0
-            prev_composite = None
-            
-            for i, session_dir in enumerate(session_dirs):
-                composite = self.create_composite_image(session_dir, timelapse_config)
-                if composite is not None:
-                    if mode_name == 'diff':
-                        # Create differential frame
-                        diff_frame = self.create_differential_frame(prev_composite, composite)
-                        frame_path = temp_dir / f"frame_{i:06d}.png"
-                        cv2.imwrite(str(frame_path), diff_frame)
-                        prev_composite = composite  # Store for next comparison
-                    else:
-                        # Normal mode - save composite directly
-                        frame_path = temp_dir / f"frame_{i:06d}.png"
-                        cv2.imwrite(str(frame_path), composite)
-                    
-                    valid_frames += 1
-                    
-            if valid_frames == 0:
-                self.logger.error(f"No valid frames created for '{name}' ({slug}) {mode_name} on {date_str}")
-                return
-                
-            # Create output directory for this timelapse
-            output_dir = self.output_dir / slug
-            output_dir.mkdir(exist_ok=True)
-            
-            # Create video using opencv
-            output_filename = f"{date_str}{suffix}.mp4"
-            output_path = output_dir / output_filename
-            
-            # Read first frame to get dimensions
-            first_frame = cv2.imread(str(temp_dir / "frame_000000.png"))
-            height, width = first_frame.shape[:2]
-            
-            # Create video writer
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            video_writer = cv2.VideoWriter(
-                str(output_path), 
-                fourcc, 
-                self.fps, 
-                (width, height)
-            )
-            
-            # Write frames to video
-            for i in range(valid_frames):
-                frame_path = temp_dir / f"frame_{i:06d}.png"
-                if frame_path.exists():
-                    frame = cv2.imread(str(frame_path))
-                    video_writer.write(frame)
-                    
-            video_writer.release()
-            
-            self.logger.info(f"{mode_name.title()} timelapse created for '{name}': {output_path} ({valid_frames} frames)")
-            
-        finally:
-            # Cleanup temporary files
-            for file in temp_dir.glob("*.png"):
-                file.unlink()
-            temp_dir.rmdir()
+        session_dirs = self.get_session_dirs_for_date(slug, date_str)
+        self.render_timelapse_from_sessions(
+            slug,
+            name,
+            timelapse_config,
+            session_dirs,
+            mode_name,
+            suffix,
+            f"{date_str}{suffix}.mp4",
+            f"on {date_str}"
+        )
             
     def run(self):
         """Run the backup system with scheduled tasks"""
