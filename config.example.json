@@ -58,6 +58,7 @@
     "timelapse_fps": 10,
     "timelapse_quality": 23,
     "background_color": [0, 0, 0],
+    "auto_crop_transparent_frames": true,
     "diff_settings": {
       "threshold": 10,
       "visualization": "colored",

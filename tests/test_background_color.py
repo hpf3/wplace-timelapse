@@ -18,6 +18,7 @@ def make_backup(**kwargs) -> TimelapseBackup:
     backup.diff_visualization = kwargs.get("diff_visualization", "colored")
     backup.diff_threshold = kwargs.get("diff_threshold", 10)
     backup.diff_enhancement_factor = kwargs.get("diff_enhancement_factor", 1.0)
+    backup.auto_crop_transparent_frames = kwargs.get("auto_crop_transparent_frames", True)
     return backup
 
 
@@ -87,5 +88,6 @@ def test_composite_preserves_background_for_transparent_tiles(tmp_path):
     composite = backup.create_composite_image(session_dir, timelapse_config)
 
     assert composite is not None
-    unique_pixels = {tuple(map(int, pixel)) for pixel in composite.reshape(-1, 3)}
+    unique_pixels = {tuple(map(int, pixel)) for pixel in composite.color.reshape(-1, 3)}
     assert unique_pixels == {backing_color}
+    assert np.count_nonzero(composite.alpha) == 0

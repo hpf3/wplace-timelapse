@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import time
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -21,6 +22,13 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 # Load environment variables
 load_dotenv()
+
+
+@dataclass
+class CompositeFrame:
+    """Container for a rendered composite frame and its transparency mask."""
+    color: np.ndarray
+    alpha: np.ndarray
 
 class TimelapseBackup:
     PLACEHOLDER_SUFFIX = '.placeholder'
@@ -54,6 +62,10 @@ class TimelapseBackup:
             self.fps = settings.get('timelapse_fps', 10)
             self.quality = settings.get('timelapse_quality', 23)
             self.background_color = self._parse_background_color(settings.get('background_color', [0, 0, 0]))
+            self.auto_crop_transparent_frames = self._parse_bool(
+                settings.get('auto_crop_transparent_frames', True),
+                True
+            )
             
             # Differential settings
             diff_settings = settings.get('diff_settings', {})
@@ -73,6 +85,10 @@ class TimelapseBackup:
             self.fps = int(os.getenv('TIMELAPSE_FPS', 10))
             self.quality = int(os.getenv('TIMELAPSE_QUALITY', 23))
             self.background_color = (0, 0, 0)
+            self.auto_crop_transparent_frames = self._parse_bool(
+                os.getenv('AUTO_CROP_TRANSPARENT_FRAMES', 'true'),
+                True
+            )
             
             # Differential settings (defaults)
             self.diff_threshold = 10
@@ -101,7 +117,8 @@ class TimelapseBackup:
                     'request_delay': self.request_delay,
                     'timelapse_fps': self.fps,
                     'timelapse_quality': self.quality,
-                    'background_color': list(self.background_color)
+                    'background_color': list(self.background_color),
+                    'auto_crop_transparent_frames': self.auto_crop_transparent_frames
                 }
             }
 
@@ -161,6 +178,17 @@ class TimelapseBackup:
                 except ValueError:
                     return default
 
+        return default
+
+    @staticmethod
+    def _parse_bool(value: Any, default: bool) -> bool:
+        """Parse truthy/falsy values from multiple input types."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+        if isinstance(value, (int, float)):
+            return value != 0
         return default
     
     def get_enabled_timelapses(self) -> List[Dict[str, Any]]:
@@ -441,8 +469,8 @@ class TimelapseBackup:
                 f"Backup session completed: {total_successful}/{total_tiles} total tiles downloaded"
             )
                 
-    def create_composite_image(self, session_dir: Path, timelapse_config: Dict[str, Any]) -> np.ndarray:
-        """Create a composite image from individual tiles"""
+    def create_composite_image(self, session_dir: Path, timelapse_config: Dict[str, Any]) -> Optional[CompositeFrame]:
+        """Create a composite image from individual tiles and retain transparency."""
         coordinates = self.get_tile_coordinates(timelapse_config)
         
         # Determine grid dimensions
@@ -475,6 +503,7 @@ class TimelapseBackup:
             self.background_color,
             dtype=np.uint8
         )
+        alpha_mask = np.zeros((composite_height, composite_width), dtype=np.uint8)
         
         for x, y in coordinates:
             tile_path = self.resolve_tile_image_path(session_dir, x, y)
@@ -484,8 +513,20 @@ class TimelapseBackup:
             tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
             if tile is None:
                 continue
-            if len(tile.shape) == 2 or tile.shape[2] == 1:
-                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+
+            if len(tile.shape) == 2:
+                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
+            elif tile.shape[2] == 1:
+                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
+            elif tile.shape[2] == 3:
+                opaque_alpha = np.full(
+                    (tile.shape[0], tile.shape[1], 1),
+                    255,
+                    dtype=tile.dtype
+                )
+                tile = np.concatenate((tile, opaque_alpha), axis=2)
+            elif tile.shape[2] != 4:
+                continue
             
             # Calculate position in composite
             x_idx = x_coords.index(x)
@@ -495,18 +536,63 @@ class TimelapseBackup:
             end_y = start_y + tile_height
             start_x = x_idx * tile_width
             end_x = start_x + tile_width
-            region = composite[start_y:end_y, start_x:end_x]
+            region = composite[start_y:end_y, start_x:end_x].astype(np.float32)
+            region_alpha = alpha_mask[start_y:end_y, start_x:end_x].astype(np.float32) / 255.0
 
-            if tile.shape[2] == 4:
-                # Preserve transparency: blend tile over the background
-                alpha = (tile[:, :, 3:4].astype(np.float32) / 255.0)
-                tile_rgb = tile[:, :, :3].astype(np.float32)
-                blended = tile_rgb * alpha + region.astype(np.float32) * (1.0 - alpha)
-                composite[start_y:end_y, start_x:end_x] = blended.astype(np.uint8)
-            else:
-                composite[start_y:end_y, start_x:end_x] = tile
+            tile_rgb = tile[:, :, :3].astype(np.float32)
+            tile_alpha = tile[:, :, 3].astype(np.float32) / 255.0
+
+            inverse_tile_alpha = 1.0 - tile_alpha
+            out_alpha = tile_alpha + region_alpha * inverse_tile_alpha
+
+            combined_color = (
+                tile_rgb * tile_alpha[..., None]
+                + region * (region_alpha * inverse_tile_alpha)[..., None]
+            )
+
+            divisor = np.maximum(out_alpha[..., None], 1e-6)
+            out_color = combined_color / divisor
+
+            zero_alpha_mask = out_alpha <= 0
+            if np.any(zero_alpha_mask):
+                out_color[zero_alpha_mask] = self.background_color
+
+            composite[start_y:end_y, start_x:end_x] = np.clip(out_color, 0, 255).astype(np.uint8)
+            alpha_mask[start_y:end_y, start_x:end_x] = np.clip(out_alpha * 255.0, 0, 255).astype(np.uint8)
             
-        return composite
+        return CompositeFrame(color=composite, alpha=alpha_mask)
+        
+    def _update_content_bounds(
+        self,
+        alpha_mask: np.ndarray,
+        bounds: Optional[Tuple[int, int, int, int]]
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Expand a running bounding box using the provided alpha mask."""
+        if alpha_mask is None or not np.any(alpha_mask):
+            return bounds
+
+        # Ensure mask is uint8 for OpenCV operations
+        if alpha_mask.dtype != np.uint8:
+            mask = alpha_mask.astype(np.uint8)
+        else:
+            mask = alpha_mask
+
+        coords = cv2.findNonZero(mask)
+        if coords is None:
+            return bounds
+
+        x, y, w, h = cv2.boundingRect(coords)
+        updated = (x, y, x + w, y + h)
+
+        if bounds is None:
+            return updated
+
+        return (
+            min(bounds[0], updated[0]),
+            min(bounds[1], updated[1]),
+            max(bounds[2], updated[2]),
+            max(bounds[3], updated[3])
+        )
         
     def create_differential_frame(self, prev_frame: np.ndarray, curr_frame: np.ndarray) -> np.ndarray:
         """Create differential frame showing changes between two frames"""
@@ -668,20 +754,28 @@ class TimelapseBackup:
 
         try:
             valid_frames = 0
-            prev_composite = None
+            prev_composite_color: Optional[np.ndarray] = None
+            first_frame_shape: Optional[Tuple[int, int]] = None
+            content_bounds: Optional[Tuple[int, int, int, int]] = None
 
             for i, session_dir in enumerate(session_dirs):
                 composite = self.create_composite_image(session_dir, timelapse_config)
                 if composite is None:
                     continue
 
+                if first_frame_shape is None:
+                    first_frame_shape = composite.color.shape[:2]
+
+                if self.auto_crop_transparent_frames:
+                    content_bounds = self._update_content_bounds(composite.alpha, content_bounds)
+
                 frame_path = temp_dir / f"frame_{i:06d}.png"
                 if mode_name == 'diff':
-                    diff_frame = self.create_differential_frame(prev_composite, composite)
+                    diff_frame = self.create_differential_frame(prev_composite_color, composite.color)
                     cv2.imwrite(str(frame_path), diff_frame)
-                    prev_composite = composite
+                    prev_composite_color = composite.color
                 else:
-                    cv2.imwrite(str(frame_path), composite)
+                    cv2.imwrite(str(frame_path), composite.color)
 
                 valid_frames += 1
 
@@ -713,16 +807,48 @@ class TimelapseBackup:
                 )
                 return
 
-            height, width = first_frame.shape[:2]
+            frame_height, frame_width = first_frame.shape[:2]
+
+            if first_frame_shape is None:
+                first_frame_shape = (frame_height, frame_width)
+
+            crop_bounds: Tuple[int, int, int, int]
+            if self.auto_crop_transparent_frames and content_bounds is not None:
+                min_x, min_y, max_x, max_y = content_bounds
+                min_x = max(0, min(min_x, frame_width - 1))
+                min_y = max(0, min(min_y, frame_height - 1))
+                max_x = max(min_x + 1, min(max_x, frame_width))
+                max_y = max(min_y + 1, min(max_y, frame_height))
+                crop_bounds = (min_x, min_y, max_x, max_y)
+            else:
+                crop_bounds = (0, 0, frame_width, frame_height)
+
+            crop_width = crop_bounds[2] - crop_bounds[0]
+            crop_height = crop_bounds[3] - crop_bounds[1]
+            if crop_width <= 0 or crop_height <= 0:
+                crop_bounds = (0, 0, frame_width, frame_height)
+                crop_width = frame_width
+                crop_height = frame_height
+
+            if (
+                self.auto_crop_transparent_frames
+                and (crop_width != frame_width or crop_height != frame_height)
+            ):
+                self.logger.info(
+                    f"Cropping '{name}' ({slug}) {mode_name} {label} to {crop_width}x{crop_height} "
+                    f"from original {frame_width}x{frame_height}"
+                )
+
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             video_writer = cv2.VideoWriter(
                 str(output_path),
                 fourcc,
                 self.fps,
-                (width, height)
+                (crop_width, crop_height)
             )
 
             try:
+                x0, y0, x1, y1 = crop_bounds
                 for i in range(len(session_dirs)):
                     frame_path = temp_dir / f"frame_{i:06d}.png"
                     if not frame_path.exists():
@@ -730,7 +856,10 @@ class TimelapseBackup:
                     frame = cv2.imread(str(frame_path))
                     if frame is None:
                         continue
-                    video_writer.write(frame)
+                    cropped = frame[y0:y1, x0:x1]
+                    if cropped.size == 0:
+                        cropped = frame
+                    video_writer.write(cropped)
             finally:
                 video_writer.release()
 
