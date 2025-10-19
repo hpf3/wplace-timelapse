@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 import time
 import json
+import subprocess
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -593,6 +595,55 @@ class TimelapseBackup:
             max(bounds[2], updated[2]),
             max(bounds[3], updated[3])
         )
+
+    def _encode_with_ffmpeg(
+        self,
+        temp_dir: Path,
+        output_path: Path,
+        fps: int,
+        crop_bounds: Tuple[int, int, int, int]
+    ) -> None:
+        """Encode PNG frames with FFmpeg using a modern codec."""
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "ffmpeg not found on PATH. Install ffmpeg with libx264/libx265/libsvtav1."
+            )
+
+        x0, y0, x1, y1 = crop_bounds
+        crop_w, crop_h = (x1 - x0), (y1 - y0)
+        crop_filter = f"crop={crop_w}:{crop_h}:{x0}:{y0}"
+
+        codec_args = [
+            "-c:v",
+            "libx264",
+            "-crf",
+            str(getattr(self, "quality", 20)),
+            "-preset",
+            "slow",
+            "-tune",
+            "animation",
+            "-x264-params",
+            "keyint=300:min-keyint=300:scenecut=0",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            str(fps),
+            "-i",
+            str(temp_dir / "frame_%06d.png"),
+            "-vf",
+            crop_filter,
+            "-an",
+            *codec_args,
+            str(output_path),
+        ]
+        subprocess.run(cmd, check=True)
         
     def create_differential_frame(self, prev_frame: np.ndarray, curr_frame: np.ndarray) -> np.ndarray:
         """Create differential frame showing changes between two frames"""
@@ -753,6 +804,7 @@ class TimelapseBackup:
         temp_dir.mkdir(exist_ok=True)
 
         try:
+            frame_index = 0
             valid_frames = 0
             prev_composite_color: Optional[np.ndarray] = None
             first_frame_shape: Optional[Tuple[int, int]] = None
@@ -769,7 +821,7 @@ class TimelapseBackup:
                 if self.auto_crop_transparent_frames:
                     content_bounds = self._update_content_bounds(composite.alpha, content_bounds)
 
-                frame_path = temp_dir / f"frame_{i:06d}.png"
+                frame_path = temp_dir / f"frame_{frame_index:06d}.png"
                 if mode_name == 'diff':
                     diff_frame = self.create_differential_frame(prev_composite_color, composite.color)
                     cv2.imwrite(str(frame_path), diff_frame)
@@ -778,6 +830,7 @@ class TimelapseBackup:
                     cv2.imwrite(str(frame_path), composite.color)
 
                 valid_frames += 1
+                frame_index += 1
 
             if valid_frames == 0:
                 self.logger.error(
@@ -790,17 +843,14 @@ class TimelapseBackup:
 
             output_path = output_dir / output_filename
 
-            first_frame_idx = min(
-                (i for i, session_dir in enumerate(session_dirs) if (temp_dir / f"frame_{i:06d}.png").exists()),
-                default=None
-            )
-            if first_frame_idx is None:
+            first_frame_path = temp_dir / "frame_000000.png"
+            if not first_frame_path.exists():
                 self.logger.error(
                     f"No frame files found for '{name}' ({slug}) {mode_name} {label}"
                 )
                 return
 
-            first_frame = cv2.imread(str(temp_dir / f"frame_{first_frame_idx:06d}.png"))
+            first_frame = cv2.imread(str(first_frame_path))
             if first_frame is None:
                 self.logger.error(
                     f"Failed to read first frame for '{name}' ({slug}) {mode_name} {label}"
@@ -830,6 +880,32 @@ class TimelapseBackup:
                 crop_width = frame_width
                 crop_height = frame_height
 
+            x0, y0, x1, y1 = crop_bounds
+
+            if crop_width % 2 != 0:
+                if x1 < frame_width:
+                    x1 = min(frame_width, x1 + 1)
+                elif x0 > 0:
+                    x0 = max(0, x0 - 1)
+                else:
+                    self.logger.warning(
+                        f"Unable to expand width to even dimension for '{name}' ({slug}) {mode_name} {label}"
+                    )
+
+            if crop_height % 2 != 0:
+                if y1 < frame_height:
+                    y1 = min(frame_height, y1 + 1)
+                elif y0 > 0:
+                    y0 = max(0, y0 - 1)
+                else:
+                    self.logger.warning(
+                        f"Unable to expand height to even dimension for '{name}' ({slug}) {mode_name} {label}"
+                    )
+
+            crop_bounds = (x0, y0, x1, y1)
+            crop_width = x1 - x0
+            crop_height = y1 - y0
+
             if (
                 self.auto_crop_transparent_frames
                 and (crop_width != frame_width or crop_height != frame_height)
@@ -839,29 +915,13 @@ class TimelapseBackup:
                     f"from original {frame_width}x{frame_height}"
                 )
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            video_writer = cv2.VideoWriter(
-                str(output_path),
-                fourcc,
-                self.fps,
-                (crop_width, crop_height)
-            )
-
             try:
-                x0, y0, x1, y1 = crop_bounds
-                for i in range(len(session_dirs)):
-                    frame_path = temp_dir / f"frame_{i:06d}.png"
-                    if not frame_path.exists():
-                        continue
-                    frame = cv2.imread(str(frame_path))
-                    if frame is None:
-                        continue
-                    cropped = frame[y0:y1, x0:x1]
-                    if cropped.size == 0:
-                        cropped = frame
-                    video_writer.write(cropped)
-            finally:
-                video_writer.release()
+                self._encode_with_ffmpeg(temp_dir, output_path, self.fps, crop_bounds)
+            except subprocess.CalledProcessError as exc:
+                self.logger.error(
+                    f"FFmpeg encoding failed for '{name}' ({slug}) {mode_name} {label}: {exc}"
+                )
+                raise
 
             self.logger.info(
                 f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({valid_frames} frames)"
