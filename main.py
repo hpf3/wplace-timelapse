@@ -13,6 +13,7 @@ import time
 import json
 import subprocess
 import shutil
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -630,6 +631,10 @@ class TimelapseBackup:
             "+faststart",
         ]
 
+        temp_output = output_path.with_name(f".tmp_{uuid.uuid4().hex}_{output_path.name}")
+        if temp_output.exists():
+            temp_output.unlink()
+
         cmd = [
             "ffmpeg",
             "-y",
@@ -645,7 +650,7 @@ class TimelapseBackup:
             crop_filter,
             "-an",
             *codec_args,
-            str(output_path),
+            str(temp_output),
         ]
         process = subprocess.Popen(
             cmd,
@@ -664,6 +669,9 @@ class TimelapseBackup:
         except Exception:
             process.kill()
             raise
+        finally:
+            if process.poll() is None:
+                process.kill()
 
         if process.returncode != 0:
             stderr_text = (
@@ -671,7 +679,14 @@ class TimelapseBackup:
                 if 'stderr_data' in locals() and stderr_data is not None
                 else ''
             )
+            if temp_output.exists():
+                try:
+                    temp_output.unlink()
+                except OSError:
+                    pass
             raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_text)
+
+        temp_output.replace(output_path)
         
     def create_differential_frame(self, prev_frame: np.ndarray, curr_frame: np.ndarray) -> np.ndarray:
         """Create differential frame showing changes between two frames"""
