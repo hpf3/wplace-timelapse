@@ -16,7 +16,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Iterable
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -598,12 +598,12 @@ class TimelapseBackup:
 
     def _encode_with_ffmpeg(
         self,
-        temp_dir: Path,
+        frame_iter: Iterable[bytes],
         output_path: Path,
         fps: int,
         crop_bounds: Tuple[int, int, int, int]
     ) -> None:
-        """Encode PNG frames with FFmpeg using a modern codec."""
+        """Encode frames streamed as PNG data into FFmpeg using a modern codec."""
         if shutil.which("ffmpeg") is None:
             raise RuntimeError(
                 "ffmpeg not found on PATH. Install ffmpeg with libx264/libx265/libsvtav1."
@@ -633,17 +633,45 @@ class TimelapseBackup:
         cmd = [
             "ffmpeg",
             "-y",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
             "-framerate",
             str(fps),
             "-i",
-            str(temp_dir / "frame_%06d.png"),
+            "-",
             "-vf",
             crop_filter,
             "-an",
             *codec_args,
             str(output_path),
         ]
-        subprocess.run(cmd, check=True)
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            for frame_data in frame_iter:
+                if process.stdin is None:
+                    raise RuntimeError("FFmpeg stdin closed unexpectedly.")
+                process.stdin.write(frame_data)
+            if process.stdin:
+                process.stdin.close()
+            _, stderr_data = process.communicate()
+        except Exception:
+            process.kill()
+            raise
+
+        if process.returncode != 0:
+            stderr_text = (
+                stderr_data.decode("utf-8", errors="replace")
+                if 'stderr_data' in locals() and stderr_data is not None
+                else ''
+            )
+            raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_text)
         
     def create_differential_frame(self, prev_frame: np.ndarray, curr_frame: np.ndarray) -> np.ndarray:
         """Create differential frame showing changes between two frames"""
@@ -799,138 +827,122 @@ class TimelapseBackup:
             f"Creating {mode_name} timelapse for '{name}' ({slug}) {label} with {len(session_dirs)} frames"
         )
 
-        safe_label = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in label)
-        temp_dir = Path(f"temp_timelapse_{slug}_{safe_label}_{mode_name}")
-        temp_dir.mkdir(exist_ok=True)
+        valid_session_dirs: List[Path] = []
+        valid_frames = 0
+        first_frame_shape: Optional[Tuple[int, int]] = None
+        content_bounds: Optional[Tuple[int, int, int, int]] = None
 
-        try:
-            frame_index = 0
-            valid_frames = 0
+        for session_dir in session_dirs:
+            composite = self.create_composite_image(session_dir, timelapse_config)
+            if composite is None:
+                continue
+
+            if first_frame_shape is None:
+                first_frame_shape = composite.color.shape[:2]
+
+            if self.auto_crop_transparent_frames:
+                content_bounds = self._update_content_bounds(composite.alpha, content_bounds)
+
+            valid_session_dirs.append(session_dir)
+            valid_frames += 1
+
+        if valid_frames == 0 or first_frame_shape is None:
+            self.logger.error(
+                f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+            )
+            return
+
+        output_dir = self.output_dir / slug
+        output_dir.mkdir(exist_ok=True)
+
+        output_path = output_dir / output_filename
+
+        frame_height, frame_width = first_frame_shape
+
+        crop_bounds: Tuple[int, int, int, int]
+        if self.auto_crop_transparent_frames and content_bounds is not None:
+            min_x, min_y, max_x, max_y = content_bounds
+            min_x = max(0, min(min_x, frame_width - 1))
+            min_y = max(0, min(min_y, frame_height - 1))
+            max_x = max(min_x + 1, min(max_x, frame_width))
+            max_y = max(min_y + 1, min(max_y, frame_height))
+            crop_bounds = (min_x, min_y, max_x, max_y)
+        else:
+            crop_bounds = (0, 0, frame_width, frame_height)
+
+        crop_width = crop_bounds[2] - crop_bounds[0]
+        crop_height = crop_bounds[3] - crop_bounds[1]
+        if crop_width <= 0 or crop_height <= 0:
+            crop_bounds = (0, 0, frame_width, frame_height)
+            crop_width = frame_width
+            crop_height = frame_height
+
+        x0, y0, x1, y1 = crop_bounds
+
+        if crop_width % 2 != 0:
+            if x1 < frame_width:
+                x1 = min(frame_width, x1 + 1)
+            elif x0 > 0:
+                x0 = max(0, x0 - 1)
+            else:
+                self.logger.warning(
+                    f"Unable to expand width to even dimension for '{name}' ({slug}) {mode_name} {label}"
+                )
+
+        if crop_height % 2 != 0:
+            if y1 < frame_height:
+                y1 = min(frame_height, y1 + 1)
+            elif y0 > 0:
+                y0 = max(0, y0 - 1)
+            else:
+                self.logger.warning(
+                    f"Unable to expand height to even dimension for '{name}' ({slug}) {mode_name} {label}"
+                )
+
+        crop_bounds = (x0, y0, x1, y1)
+        crop_width = x1 - x0
+        crop_height = y1 - y0
+
+        if (
+            self.auto_crop_transparent_frames
+            and (crop_width != frame_width or crop_height != frame_height)
+        ):
+            self.logger.info(
+                f"Cropping '{name}' ({slug}) {mode_name} {label} to {crop_width}x{crop_height} "
+                f"from original {frame_width}x{frame_height}"
+            )
+
+        def frame_generator() -> Iterable[bytes]:
             prev_composite_color: Optional[np.ndarray] = None
-            first_frame_shape: Optional[Tuple[int, int]] = None
-            content_bounds: Optional[Tuple[int, int, int, int]] = None
-
-            for i, session_dir in enumerate(session_dirs):
+            for session_dir in valid_session_dirs:
                 composite = self.create_composite_image(session_dir, timelapse_config)
                 if composite is None:
                     continue
 
-                if first_frame_shape is None:
-                    first_frame_shape = composite.color.shape[:2]
-
-                if self.auto_crop_transparent_frames:
-                    content_bounds = self._update_content_bounds(composite.alpha, content_bounds)
-
-                frame_path = temp_dir / f"frame_{frame_index:06d}.png"
                 if mode_name == 'diff':
-                    diff_frame = self.create_differential_frame(prev_composite_color, composite.color)
-                    cv2.imwrite(str(frame_path), diff_frame)
+                    frame = self.create_differential_frame(prev_composite_color, composite.color)
                     prev_composite_color = composite.color
                 else:
-                    cv2.imwrite(str(frame_path), composite.color)
+                    frame = composite.color
 
-                valid_frames += 1
-                frame_index += 1
-
-            if valid_frames == 0:
-                self.logger.error(
-                    f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
-                )
-                return
-
-            output_dir = self.output_dir / slug
-            output_dir.mkdir(exist_ok=True)
-
-            output_path = output_dir / output_filename
-
-            first_frame_path = temp_dir / "frame_000000.png"
-            if not first_frame_path.exists():
-                self.logger.error(
-                    f"No frame files found for '{name}' ({slug}) {mode_name} {label}"
-                )
-                return
-
-            first_frame = cv2.imread(str(first_frame_path))
-            if first_frame is None:
-                self.logger.error(
-                    f"Failed to read first frame for '{name}' ({slug}) {mode_name} {label}"
-                )
-                return
-
-            frame_height, frame_width = first_frame.shape[:2]
-
-            if first_frame_shape is None:
-                first_frame_shape = (frame_height, frame_width)
-
-            crop_bounds: Tuple[int, int, int, int]
-            if self.auto_crop_transparent_frames and content_bounds is not None:
-                min_x, min_y, max_x, max_y = content_bounds
-                min_x = max(0, min(min_x, frame_width - 1))
-                min_y = max(0, min(min_y, frame_height - 1))
-                max_x = max(min_x + 1, min(max_x, frame_width))
-                max_y = max(min_y + 1, min(max_y, frame_height))
-                crop_bounds = (min_x, min_y, max_x, max_y)
-            else:
-                crop_bounds = (0, 0, frame_width, frame_height)
-
-            crop_width = crop_bounds[2] - crop_bounds[0]
-            crop_height = crop_bounds[3] - crop_bounds[1]
-            if crop_width <= 0 or crop_height <= 0:
-                crop_bounds = (0, 0, frame_width, frame_height)
-                crop_width = frame_width
-                crop_height = frame_height
-
-            x0, y0, x1, y1 = crop_bounds
-
-            if crop_width % 2 != 0:
-                if x1 < frame_width:
-                    x1 = min(frame_width, x1 + 1)
-                elif x0 > 0:
-                    x0 = max(0, x0 - 1)
-                else:
-                    self.logger.warning(
-                        f"Unable to expand width to even dimension for '{name}' ({slug}) {mode_name} {label}"
+                success, buffer = cv2.imencode(".png", frame)
+                if not success:
+                    raise RuntimeError(
+                        f"Failed to encode frame for '{name}' ({slug}) {mode_name} {label}"
                     )
+                yield buffer.tobytes()
 
-            if crop_height % 2 != 0:
-                if y1 < frame_height:
-                    y1 = min(frame_height, y1 + 1)
-                elif y0 > 0:
-                    y0 = max(0, y0 - 1)
-                else:
-                    self.logger.warning(
-                        f"Unable to expand height to even dimension for '{name}' ({slug}) {mode_name} {label}"
-                    )
-
-            crop_bounds = (x0, y0, x1, y1)
-            crop_width = x1 - x0
-            crop_height = y1 - y0
-
-            if (
-                self.auto_crop_transparent_frames
-                and (crop_width != frame_width or crop_height != frame_height)
-            ):
-                self.logger.info(
-                    f"Cropping '{name}' ({slug}) {mode_name} {label} to {crop_width}x{crop_height} "
-                    f"from original {frame_width}x{frame_height}"
-                )
-
-            try:
-                self._encode_with_ffmpeg(temp_dir, output_path, self.fps, crop_bounds)
-            except subprocess.CalledProcessError as exc:
-                self.logger.error(
-                    f"FFmpeg encoding failed for '{name}' ({slug}) {mode_name} {label}: {exc}"
-                )
-                raise
-
-            self.logger.info(
-                f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({valid_frames} frames)"
+        try:
+            self._encode_with_ffmpeg(frame_generator(), output_path, self.fps, crop_bounds)
+        except subprocess.CalledProcessError as exc:
+            self.logger.error(
+                f"FFmpeg encoding failed for '{name}' ({slug}) {mode_name} {label}: {exc.stderr or exc}"
             )
+            raise
 
-        finally:
-            for file in temp_dir.glob("*.png"):
-                file.unlink()
-            temp_dir.rmdir()
+        self.logger.info(
+            f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({valid_frames} frames)"
+        )
         
     def create_daily_timelapse(self, date: datetime = None):
         """Create timelapse videos from previous day's images for all timelapses"""
