@@ -658,6 +658,8 @@ class TimelapseBackup:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        stderr_data: bytes = b""
+        return_code: Optional[int] = None
         try:
             for frame_data in frame_iter:
                 if process.stdin is None:
@@ -665,18 +667,31 @@ class TimelapseBackup:
                 process.stdin.write(frame_data)
             if process.stdin:
                 process.stdin.close()
-            _, stderr_data = process.communicate()
+            return_code = process.wait()
+            if process.stderr is not None:
+                stderr_data = process.stderr.read()
         except Exception:
             process.kill()
             raise
         finally:
-            if process.poll() is None:
-                process.kill()
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            if process.stderr is not None:
+                try:
+                    process.stderr.close()
+                except OSError:
+                    pass
 
-        if process.returncode != 0:
+        if return_code is None:
+            return_code = process.poll()
+
+        if return_code != 0:
             stderr_text = (
                 stderr_data.decode("utf-8", errors="replace")
-                if 'stderr_data' in locals() and stderr_data is not None
+                if stderr_data
                 else ''
             )
             if temp_output.exists():
@@ -684,7 +699,7 @@ class TimelapseBackup:
                     temp_output.unlink()
                 except OSError:
                     pass
-            raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_text)
+            raise subprocess.CalledProcessError(return_code or -1, cmd, stderr=stderr_text)
 
         temp_output.replace(output_path)
         
