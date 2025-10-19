@@ -927,9 +927,15 @@ class TimelapseBackup:
                 f"from original {frame_width}x{frame_height}"
             )
 
+        total_frames = len(valid_session_dirs)
+        self.logger.info(
+            f"Streaming {total_frames} frames to FFmpeg for '{name}' ({slug}) {mode_name} {label}"
+        )
+
         def frame_generator() -> Iterable[bytes]:
             prev_composite_color: Optional[np.ndarray] = None
-            for session_dir in valid_session_dirs:
+            progress_interval = max(1, total_frames // 20)
+            for index, session_dir in enumerate(valid_session_dirs, start=1):
                 composite = self.create_composite_image(session_dir, timelapse_config)
                 if composite is None:
                     continue
@@ -946,6 +952,13 @@ class TimelapseBackup:
                         f"Failed to encode frame for '{name}' ({slug}) {mode_name} {label}"
                     )
                 yield buffer.tobytes()
+
+                if index % progress_interval == 0 or index == total_frames:
+                    percent = (index / total_frames) * 100.0
+                    self.logger.info(
+                        f"Encoding progress for '{name}' ({slug}) {mode_name} {label}: "
+                        f"{index}/{total_frames} frames ({percent:.1f}%)"
+                    )
 
         try:
             self._encode_with_ffmpeg(frame_generator(), output_path, self.fps, crop_bounds)
