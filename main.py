@@ -14,6 +14,7 @@ import json
 import subprocess
 import shutil
 import uuid
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -660,6 +661,29 @@ class TimelapseBackup:
         )
         stderr_data: bytes = b""
         return_code: Optional[int] = None
+        stderr_chunks: List[bytes] = []
+        stderr_thread: Optional[threading.Thread] = None
+
+        if process.stderr is not None:
+            def _drain_stderr(pipe: Any, collector: List[bytes]) -> None:
+                """Continuously read FFmpeg stderr so it cannot block."""
+                try:
+                    for chunk in iter(lambda: pipe.read(8192), b""):
+                        if chunk:
+                            collector.append(chunk)
+                finally:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+
+            stderr_thread = threading.Thread(
+                target=_drain_stderr,
+                args=(process.stderr, stderr_chunks),
+                daemon=True,
+            )
+            stderr_thread.start()
+
         try:
             for frame_data in frame_iter:
                 if process.stdin is None:
@@ -668,8 +692,6 @@ class TimelapseBackup:
             if process.stdin:
                 process.stdin.close()
             return_code = process.wait()
-            if process.stderr is not None:
-                stderr_data = process.stderr.read()
         except Exception:
             process.kill()
             raise
@@ -679,11 +701,21 @@ class TimelapseBackup:
                     process.stdin.close()
                 except OSError:
                     pass
-            if process.stderr is not None:
+            if stderr_thread is not None:
+                stderr_thread.join()
+            elif process.stderr is not None:
                 try:
                     process.stderr.close()
                 except OSError:
                     pass
+
+        if stderr_thread is not None:
+            stderr_data = b"".join(stderr_chunks)
+        elif process.stderr is not None:
+            try:
+                stderr_data = process.stderr.read()
+            except OSError:
+                stderr_data = b""
 
         if return_code is None:
             return_code = process.poll()
@@ -862,9 +894,18 @@ class TimelapseBackup:
         first_frame_shape: Optional[Tuple[int, int]] = None
         content_bounds: Optional[Tuple[int, int, int, int]] = None
 
-        for session_dir in session_dirs:
+        prep_total = len(session_dirs)
+        prep_interval = max(1, prep_total // 20)
+
+        for index, session_dir in enumerate(session_dirs, start=1):
             composite = self.create_composite_image(session_dir, timelapse_config)
             if composite is None:
+                if index % prep_interval == 0 or index == prep_total:
+                    percent = (index / prep_total) * 100.0
+                    self.logger.info(
+                        f"Frame preparation progress for '{name}' ({slug}) {mode_name} {label}: "
+                        f"{index}/{prep_total} sessions scanned, {valid_frames} usable ({percent:.1f}%)"
+                    )
                 continue
 
             if first_frame_shape is None:
@@ -875,6 +916,12 @@ class TimelapseBackup:
 
             valid_session_dirs.append(session_dir)
             valid_frames += 1
+            if index % prep_interval == 0 or index == prep_total:
+                percent = (index / prep_total) * 100.0
+                self.logger.info(
+                    f"Frame preparation progress for '{name}' ({slug}) {mode_name} {label}: "
+                    f"{index}/{prep_total} sessions scanned, {valid_frames} usable ({percent:.1f}%)"
+                )
 
         if valid_frames == 0 or first_frame_shape is None:
             self.logger.error(
