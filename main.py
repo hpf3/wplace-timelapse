@@ -15,10 +15,12 @@ import subprocess
 import shutil
 import uuid
 import threading
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,6 +35,23 @@ class CompositeFrame:
     """Container for a rendered composite frame and its transparency mask."""
     color: np.ndarray
     alpha: np.ndarray
+
+
+@dataclass
+class FrameManifest:
+    """Resolved tile paths for a single frame."""
+    session_dir: Path
+    tile_paths: Dict[Tuple[int, int], Path]
+
+
+@dataclass
+class PreparedFrame:
+    """Prepared frame data persisted to temporary storage."""
+    index: int
+    session_dir: Path
+    temp_path: Optional[Path]
+    frame_shape: Optional[Tuple[int, int]]
+    alpha_bounds: Optional[Tuple[int, int, int, int]]
 
 class TimelapseBackup:
     PLACEHOLDER_SUFFIX = '.placeholder'
@@ -70,6 +89,11 @@ class TimelapseBackup:
                 settings.get('auto_crop_transparent_frames', True),
                 True
             )
+            default_workers = max(1, min(4, os.cpu_count() or 1))
+            self.frame_prep_workers = self._parse_positive_int(
+                settings.get('frame_prep_workers', default_workers),
+                default_workers
+            )
             
             # Differential settings
             diff_settings = settings.get('diff_settings', {})
@@ -92,6 +116,11 @@ class TimelapseBackup:
             self.auto_crop_transparent_frames = self._parse_bool(
                 os.getenv('AUTO_CROP_TRANSPARENT_FRAMES', 'true'),
                 True
+            )
+            default_workers = max(1, min(4, os.cpu_count() or 1))
+            self.frame_prep_workers = self._parse_positive_int(
+                os.getenv('FRAME_PREP_WORKERS'),
+                default_workers
             )
             
             # Differential settings (defaults)
@@ -194,6 +223,15 @@ class TimelapseBackup:
         if isinstance(value, (int, float)):
             return value != 0
         return default
+
+    @staticmethod
+    def _parse_positive_int(value: Any, default: int) -> int:
+        """Parse a positive integer with fallback to default."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
     
     def get_enabled_timelapses(self) -> List[Dict[str, Any]]:
         """Get list of enabled timelapse configurations"""
@@ -505,94 +543,116 @@ class TimelapseBackup:
                 f"Backup session completed: {total_successful}/{total_tiles} total tiles downloaded"
             )
                 
-    def create_composite_image(
+    def _build_manifest_for_session(
         self,
         session_dir: Path,
         timelapse_config: Dict[str, Any],
-        tile_cache: Optional[Dict[Tuple[int, int], Path]] = None
-    ) -> Optional[CompositeFrame]:
-        """Create a composite image from individual tiles and retain transparency."""
-        coordinates = self.get_tile_coordinates(timelapse_config)
-
+        coordinates: List[Tuple[int, int]],
+        tile_cache: Optional[Dict[Tuple[int, int], Path]],
+        prior_sessions: Optional[List[Path]] = None,
+    ) -> Optional[FrameManifest]:
+        """Resolve tile paths for a session using existing fallback logic."""
         slug = timelapse_config.get('slug')
         if not slug:
             slug = self._extract_slug_from_session(session_dir)
-        prior_sessions: List[Path] = self.get_prior_sessions(slug, session_dir) if slug else []
 
-        # Determine grid dimensions
-        x_coords = sorted(set(x for x, y in coordinates))
-        y_coords = sorted(set(y for x, y in coordinates))
+        if prior_sessions is None:
+            prior_sessions = self.get_prior_sessions(slug, session_dir) if slug else []
 
-        # Load first image to get tile dimensions
-        first_tile = None
+        manifest_tile_cache = tile_cache if tile_cache is not None else {}
+        tile_paths: Dict[Tuple[int, int], Path] = {}
+
         for x, y in coordinates:
             tile_path = self.resolve_tile_image_path(session_dir, x, y, prior_sessions)
-            if tile_path is None and tile_cache:
-                cached = tile_cache.get((x, y))
+            if tile_path is None and tile_cache is not None:
+                cached = manifest_tile_cache.get((x, y))
                 if cached and cached.exists():
                     tile_path = cached
-            if tile_path:
-                first_tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
-                if first_tile is not None and len(first_tile.shape) == 2:
-                    first_tile = cv2.cvtColor(first_tile, cv2.COLOR_GRAY2BGR)
-                elif first_tile is not None and first_tile.shape[2] == 1:
-                    first_tile = cv2.cvtColor(first_tile, cv2.COLOR_GRAY2BGR)
-                if first_tile is not None:
-                    break
+
+            if tile_path is None or not tile_path.exists():
+                continue
+
+            if tile_cache is not None:
+                manifest_tile_cache[(x, y)] = tile_path
+            tile_paths[(x, y)] = tile_path
+
+        if not tile_paths:
+            return None
+
+        return FrameManifest(session_dir=session_dir, tile_paths=tile_paths)
+
+    def _compose_frame_from_manifest(
+        self,
+        manifest: FrameManifest,
+        coordinates: List[Tuple[int, int]],
+        x_coords: List[int],
+        y_coords: List[int],
+        x_index_map: Dict[int, int],
+        y_index_map: Dict[int, int],
+    ) -> Optional[CompositeFrame]:
+        """Compose a frame using tile paths resolved in a manifest."""
+        first_tile: Optional[np.ndarray] = None
+        for x, y in coordinates:
+            tile_path = manifest.tile_paths.get((x, y))
+            if not tile_path or not tile_path.exists():
+                continue
+            tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
+            if tile is None:
+                continue
+            if len(tile.shape) == 2:
+                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
+            elif tile.shape[2] == 1:
+                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
+            elif tile.shape[2] == 3:
+                opaque_alpha = np.full((tile.shape[0], tile.shape[1], 1), 255, dtype=tile.dtype)
+                tile = np.concatenate((tile, opaque_alpha), axis=2)
+            elif tile.shape[2] != 4:
+                continue
+            first_tile = tile
+            break
 
         if first_tile is None:
             return None
-            
+
         tile_height, tile_width = first_tile.shape[:2]
-        
-        # Create composite image
         composite_height = len(y_coords) * tile_height
         composite_width = len(x_coords) * tile_width
         composite = np.full(
             (composite_height, composite_width, 3),
             self.background_color,
-            dtype=np.uint8
+            dtype=np.uint8,
         )
         alpha_mask = np.zeros((composite_height, composite_width), dtype=np.uint8)
 
         for x, y in coordinates:
-            tile_path = self.resolve_tile_image_path(session_dir, x, y, prior_sessions)
-            if tile_path is None and tile_cache:
-                cached = tile_cache.get((x, y))
-                if cached and cached.exists():
-                    tile_path = cached
-            if not tile_path:
+            tile_path = manifest.tile_paths.get((x, y))
+            if not tile_path or not tile_path.exists():
                 continue
 
             tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
             if tile is None:
                 continue
 
-            if tile_cache is not None and tile_path.exists():
-                tile_cache[(x, y)] = tile_path
-
             if len(tile.shape) == 2:
                 tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
             elif tile.shape[2] == 1:
                 tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
             elif tile.shape[2] == 3:
-                opaque_alpha = np.full(
-                    (tile.shape[0], tile.shape[1], 1),
-                    255,
-                    dtype=tile.dtype
-                )
+                opaque_alpha = np.full((tile.shape[0], tile.shape[1], 1), 255, dtype=tile.dtype)
                 tile = np.concatenate((tile, opaque_alpha), axis=2)
             elif tile.shape[2] != 4:
                 continue
-            
-            # Calculate position in composite
-            x_idx = x_coords.index(x)
-            y_idx = y_coords.index(y)
-            
+
+            x_idx = x_index_map.get(x)
+            y_idx = y_index_map.get(y)
+            if x_idx is None or y_idx is None:
+                continue
+
             start_y = y_idx * tile_height
             end_y = start_y + tile_height
             start_x = x_idx * tile_width
             end_x = start_x + tile_width
+
             region = composite[start_y:end_y, start_x:end_x].astype(np.float32)
             region_alpha = alpha_mask[start_y:end_y, start_x:end_x].astype(np.float32) / 255.0
 
@@ -616,8 +676,40 @@ class TimelapseBackup:
 
             composite[start_y:end_y, start_x:end_x] = np.clip(out_color, 0, 255).astype(np.uint8)
             alpha_mask[start_y:end_y, start_x:end_x] = np.clip(out_alpha * 255.0, 0, 255).astype(np.uint8)
-            
+
         return CompositeFrame(color=composite, alpha=alpha_mask)
+
+    def create_composite_image(
+        self,
+        session_dir: Path,
+        timelapse_config: Dict[str, Any],
+        tile_cache: Optional[Dict[Tuple[int, int], Path]] = None
+    ) -> Optional[CompositeFrame]:
+        """Create a composite image from individual tiles and retain transparency."""
+        coordinates = self.get_tile_coordinates(timelapse_config)
+
+        manifest = self._build_manifest_for_session(
+            session_dir,
+            timelapse_config,
+            coordinates,
+            tile_cache,
+        )
+        if manifest is None:
+            return None
+
+        x_coords = sorted(set(x for x, y in coordinates))
+        y_coords = sorted(set(y for x, y in coordinates))
+        x_index_map = {value: idx for idx, value in enumerate(x_coords)}
+        y_index_map = {value: idx for idx, value in enumerate(y_coords)}
+
+        return self._compose_frame_from_manifest(
+            manifest,
+            coordinates,
+            x_coords,
+            y_coords,
+            x_index_map,
+            y_index_map,
+        )
         
     def _update_content_bounds(
         self,
@@ -649,6 +741,23 @@ class TimelapseBackup:
             min(bounds[1], updated[1]),
             max(bounds[2], updated[2]),
             max(bounds[3], updated[3])
+        )
+
+    @staticmethod
+    def _merge_bounds(
+        current: Optional[Tuple[int, int, int, int]],
+        new: Optional[Tuple[int, int, int, int]],
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Merge two bounding boxes if both exist."""
+        if new is None:
+            return current
+        if current is None:
+            return new
+        return (
+            min(current[0], new[0]),
+            min(current[1], new[1]),
+            max(current[2], new[2]),
+            max(current[3], new[3]),
         )
 
     def _encode_with_ffmpeg(
@@ -920,6 +1029,195 @@ class TimelapseBackup:
         sessions.sort(key=lambda item: item[0])
         return [path for _, path in sessions]
 
+    def _build_frame_manifests(
+        self,
+        session_dirs: List[Path],
+        timelapse_config: Dict[str, Any],
+        coordinates: List[Tuple[int, int]],
+        slug: str,
+        name: str,
+        mode_name: str,
+        label: str,
+    ) -> List[FrameManifest]:
+        """Generate frame manifests while respecting placeholder fallbacks."""
+        manifests: List[FrameManifest] = []
+        manifest_tile_cache: Dict[Tuple[int, int], Path] = {}
+        prep_total = len(session_dirs)
+        if prep_total == 0:
+            return manifests
+
+        prep_interval = max(1, prep_total // 20)
+        valid_frames = 0
+
+        for index, session_dir in enumerate(session_dirs, start=1):
+            manifest = self._build_manifest_for_session(
+                session_dir,
+                timelapse_config,
+                coordinates,
+                manifest_tile_cache,
+            )
+            if manifest is not None:
+                manifests.append(manifest)
+                valid_frames += 1
+
+            if index % prep_interval == 0 or index == prep_total:
+                percent = (index / prep_total) * 100.0
+                self.logger.info(
+                    f"Frame preparation progress for '{name}' ({slug}) {mode_name} {label}: "
+                    f"{index}/{prep_total} sessions scanned, {valid_frames} usable ({percent:.1f}%)"
+                )
+
+        return manifests
+
+    def _render_frame_from_manifest(
+        self,
+        index: int,
+        manifest: FrameManifest,
+        coordinates: List[Tuple[int, int]],
+        x_coords: List[int],
+        y_coords: List[int],
+        x_index_map: Dict[int, int],
+        y_index_map: Dict[int, int],
+        temp_dir: Path,
+    ) -> PreparedFrame:
+        """Worker routine to render a composite and persist it to disk."""
+        composite = self._compose_frame_from_manifest(
+            manifest,
+            coordinates,
+            x_coords,
+            y_coords,
+            x_index_map,
+            y_index_map,
+        )
+        if composite is None:
+            return PreparedFrame(
+                index=index,
+                session_dir=manifest.session_dir,
+                temp_path=None,
+                frame_shape=None,
+                alpha_bounds=None,
+            )
+
+        frame_bounds = None
+        if self.auto_crop_transparent_frames:
+            frame_bounds = self._update_content_bounds(composite.alpha, None)
+
+        success, buffer = cv2.imencode(".png", composite.color)
+        if not success:
+            raise RuntimeError(
+                f"Failed to encode frame for manifest index {index} ({manifest.session_dir})"
+            )
+
+        temp_path = temp_dir / f"frame_{index:06d}.png"
+        temp_path.write_bytes(buffer.tobytes())
+
+        return PreparedFrame(
+            index=index,
+            session_dir=manifest.session_dir,
+            temp_path=temp_path,
+            frame_shape=composite.color.shape[:2],
+            alpha_bounds=frame_bounds,
+        )
+
+    def _prepare_frames_from_manifests(
+        self,
+        manifests: List[FrameManifest],
+        coordinates: List[Tuple[int, int]],
+        x_coords: List[int],
+        y_coords: List[int],
+        x_index_map: Dict[int, int],
+        y_index_map: Dict[int, int],
+        temp_dir: Path,
+        slug: str,
+        name: str,
+        mode_name: str,
+        label: str,
+    ) -> List[PreparedFrame]:
+        """Render frames in parallel using previously built manifests."""
+        if not manifests:
+            return []
+
+        max_workers = max(1, getattr(self, "frame_prep_workers", 1))
+        total = len(manifests)
+        progress_interval = max(1, total // 20)
+        prepared: List[Optional[PreparedFrame]] = [None] * total
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._render_frame_from_manifest,
+                    index,
+                    manifest,
+                    coordinates,
+                    x_coords,
+                    y_coords,
+                    x_index_map,
+                    y_index_map,
+                    temp_dir,
+                )
+                for index, manifest in enumerate(manifests)
+            ]
+
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
+                prepared[result.index] = result
+                completed += 1
+                if completed % progress_interval == 0 or completed == total:
+                    percent = (completed / total) * 100.0
+                    self.logger.info(
+                        f"Frame rendering progress for '{name}' ({slug}) {mode_name} {label}: "
+                        f"{completed}/{total} frames ({percent:.1f}%)"
+                    )
+
+        return [frame for frame in prepared if frame and frame.temp_path is not None]
+
+    def _frame_byte_generator(
+        self,
+        prepared_frames: List[PreparedFrame],
+        mode_name: str,
+        slug: str,
+        name: str,
+        label: str,
+    ) -> Iterable[bytes]:
+        """Yield encoded PNG data for prepared frames in order."""
+        total_frames = len(prepared_frames)
+        if total_frames == 0:
+            return
+
+        progress_interval = max(1, total_frames // 20)
+        prev_composite_color: Optional[np.ndarray] = None
+
+        for index, prepared in enumerate(prepared_frames, start=1):
+            if prepared.temp_path is None:
+                continue
+
+            if mode_name == "diff":
+                composite_color = cv2.imread(str(prepared.temp_path), cv2.IMREAD_COLOR)
+                if composite_color is None:
+                    raise RuntimeError(
+                        f"Failed to read prepared composite for diff mode: {prepared.temp_path}"
+                    )
+                frame = self.create_differential_frame(prev_composite_color, composite_color)
+                prev_composite_color = composite_color
+                success, buffer = cv2.imencode(".png", frame)
+                if not success:
+                    raise RuntimeError(
+                        f"Failed to encode differential frame for '{name}' ({slug}) {mode_name} {label}"
+                    )
+                frame_bytes = buffer.tobytes()
+            else:
+                frame_bytes = prepared.temp_path.read_bytes()
+
+            yield frame_bytes
+
+            if index % progress_interval == 0 or index == total_frames:
+                percent = (index / total_frames) * 100.0
+                self.logger.info(
+                    f"Encoding progress for '{name}' ({slug}) {mode_name} {label}: "
+                    f"{index}/{total_frames} frames ({percent:.1f}%)"
+                )
+
     def render_timelapse_from_sessions(
         self,
         slug: str,
@@ -942,42 +1240,28 @@ class TimelapseBackup:
             f"Creating {mode_name} timelapse for '{name}' ({slug}) {label} with {len(session_dirs)} frames"
         )
 
-        valid_session_dirs: List[Path] = []
-        valid_frames = 0
-        first_frame_shape: Optional[Tuple[int, int]] = None
-        content_bounds: Optional[Tuple[int, int, int, int]] = None
+        coordinates = self.get_tile_coordinates(timelapse_config)
+        if not coordinates:
+            self.logger.error(
+                f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+            )
+            return
 
-        prep_total = len(session_dirs)
-        prep_interval = max(1, prep_total // 20)
+        x_coords = sorted(set(x for x, y in coordinates))
+        y_coords = sorted(set(y for x, y in coordinates))
+        x_index_map = {value: idx for idx, value in enumerate(x_coords)}
+        y_index_map = {value: idx for idx, value in enumerate(y_coords)}
 
-        prep_tile_cache: Dict[Tuple[int, int], Path] = {}
-        for index, session_dir in enumerate(session_dirs, start=1):
-            composite = self.create_composite_image(session_dir, timelapse_config, prep_tile_cache)
-            if composite is None:
-                if index % prep_interval == 0 or index == prep_total:
-                    percent = (index / prep_total) * 100.0
-                    self.logger.info(
-                        f"Frame preparation progress for '{name}' ({slug}) {mode_name} {label}: "
-                        f"{index}/{prep_total} sessions scanned, {valid_frames} usable ({percent:.1f}%)"
-                    )
-                continue
-
-            if first_frame_shape is None:
-                first_frame_shape = composite.color.shape[:2]
-
-            if self.auto_crop_transparent_frames:
-                content_bounds = self._update_content_bounds(composite.alpha, content_bounds)
-
-            valid_session_dirs.append(session_dir)
-            valid_frames += 1
-            if index % prep_interval == 0 or index == prep_total:
-                percent = (index / prep_total) * 100.0
-                self.logger.info(
-                    f"Frame preparation progress for '{name}' ({slug}) {mode_name} {label}: "
-                    f"{index}/{prep_total} sessions scanned, {valid_frames} usable ({percent:.1f}%)"
-                )
-
-        if valid_frames == 0 or first_frame_shape is None:
+        manifests = self._build_frame_manifests(
+            session_dirs,
+            timelapse_config,
+            coordinates,
+            slug,
+            name,
+            mode_name,
+            label,
+        )
+        if not manifests:
             self.logger.error(
                 f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
             )
@@ -988,105 +1272,123 @@ class TimelapseBackup:
 
         output_path = output_dir / output_filename
 
-        frame_height, frame_width = first_frame_shape
+        total_frames = 0
 
-        crop_bounds: Tuple[int, int, int, int]
-        if self.auto_crop_transparent_frames and content_bounds is not None:
-            min_x, min_y, max_x, max_y = content_bounds
-            min_x = max(0, min(min_x, frame_width - 1))
-            min_y = max(0, min(min_y, frame_height - 1))
-            max_x = max(min_x + 1, min(max_x, frame_width))
-            max_y = max(min_y + 1, min(max_y, frame_height))
-            crop_bounds = (min_x, min_y, max_x, max_y)
-        else:
-            crop_bounds = (0, 0, frame_width, frame_height)
-
-        crop_width = crop_bounds[2] - crop_bounds[0]
-        crop_height = crop_bounds[3] - crop_bounds[1]
-        if crop_width <= 0 or crop_height <= 0:
-            crop_bounds = (0, 0, frame_width, frame_height)
-            crop_width = frame_width
-            crop_height = frame_height
-
-        x0, y0, x1, y1 = crop_bounds
-
-        if crop_width % 2 != 0:
-            if x1 < frame_width:
-                x1 = min(frame_width, x1 + 1)
-            elif x0 > 0:
-                x0 = max(0, x0 - 1)
-            else:
-                self.logger.warning(
-                    f"Unable to expand width to even dimension for '{name}' ({slug}) {mode_name} {label}"
-                )
-
-        if crop_height % 2 != 0:
-            if y1 < frame_height:
-                y1 = min(frame_height, y1 + 1)
-            elif y0 > 0:
-                y0 = max(0, y0 - 1)
-            else:
-                self.logger.warning(
-                    f"Unable to expand height to even dimension for '{name}' ({slug}) {mode_name} {label}"
-                )
-
-        crop_bounds = (x0, y0, x1, y1)
-        crop_width = x1 - x0
-        crop_height = y1 - y0
-
-        if (
-            self.auto_crop_transparent_frames
-            and (crop_width != frame_width or crop_height != frame_height)
-        ):
-            self.logger.info(
-                f"Cropping '{name}' ({slug}) {mode_name} {label} to {crop_width}x{crop_height} "
-                f"from original {frame_width}x{frame_height}"
+        with tempfile.TemporaryDirectory() as temp_dir_str:
+            temp_dir = Path(temp_dir_str)
+            prepared_frames = self._prepare_frames_from_manifests(
+                manifests,
+                coordinates,
+                x_coords,
+                y_coords,
+                x_index_map,
+                y_index_map,
+                temp_dir,
+                slug,
+                name,
+                mode_name,
+                label,
             )
 
-        total_frames = len(valid_session_dirs)
-        self.logger.info(
-            f"Streaming {total_frames} frames to FFmpeg for '{name}' ({slug}) {mode_name} {label}"
-        )
+            if not prepared_frames:
+                self.logger.error(
+                    f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+                )
+                return
 
-        def frame_generator() -> Iterable[bytes]:
-            tile_cache: Dict[Tuple[int, int], Path] = {}
-            prev_composite_color: Optional[np.ndarray] = None
-            progress_interval = max(1, total_frames // 20)
-            for index, session_dir in enumerate(valid_session_dirs, start=1):
-                composite = self.create_composite_image(session_dir, timelapse_config, tile_cache)
-                if composite is None:
+            first_frame_shape: Optional[Tuple[int, int]] = None
+            content_bounds: Optional[Tuple[int, int, int, int]] = None
+
+            for frame in prepared_frames:
+                if frame.frame_shape is None:
                     continue
+                if first_frame_shape is None:
+                    first_frame_shape = frame.frame_shape
+                if self.auto_crop_transparent_frames and frame.alpha_bounds is not None:
+                    content_bounds = self._merge_bounds(content_bounds, frame.alpha_bounds)
 
-                if mode_name == 'diff':
-                    frame = self.create_differential_frame(prev_composite_color, composite.color)
-                    prev_composite_color = composite.color
+            if first_frame_shape is None:
+                self.logger.error(
+                    f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+                )
+                return
+
+            frame_height, frame_width = first_frame_shape
+
+            if self.auto_crop_transparent_frames and content_bounds is not None:
+                min_x, min_y, max_x, max_y = content_bounds
+                min_x = max(0, min(min_x, frame_width - 1))
+                min_y = max(0, min(min_y, frame_height - 1))
+                max_x = max(min_x + 1, min(max_x, frame_width))
+                max_y = max(min_y + 1, min(max_y, frame_height))
+                crop_bounds = (min_x, min_y, max_x, max_y)
+            else:
+                crop_bounds = (0, 0, frame_width, frame_height)
+
+            crop_width = crop_bounds[2] - crop_bounds[0]
+            crop_height = crop_bounds[3] - crop_bounds[1]
+            if crop_width <= 0 or crop_height <= 0:
+                crop_bounds = (0, 0, frame_width, frame_height)
+                crop_width = frame_width
+                crop_height = frame_height
+
+            x0, y0, x1, y1 = crop_bounds
+
+            if crop_width % 2 != 0:
+                if x1 < frame_width:
+                    x1 = min(frame_width, x1 + 1)
+                elif x0 > 0:
+                    x0 = max(0, x0 - 1)
                 else:
-                    frame = composite.color
-
-                success, buffer = cv2.imencode(".png", frame)
-                if not success:
-                    raise RuntimeError(
-                        f"Failed to encode frame for '{name}' ({slug}) {mode_name} {label}"
-                    )
-                yield buffer.tobytes()
-
-                if index % progress_interval == 0 or index == total_frames:
-                    percent = (index / total_frames) * 100.0
-                    self.logger.info(
-                        f"Encoding progress for '{name}' ({slug}) {mode_name} {label}: "
-                        f"{index}/{total_frames} frames ({percent:.1f}%)"
+                    self.logger.warning(
+                        f"Unable to expand width to even dimension for '{name}' ({slug}) {mode_name} {label}"
                     )
 
-        try:
-            self._encode_with_ffmpeg(frame_generator(), output_path, self.fps, crop_bounds)
-        except subprocess.CalledProcessError as exc:
-            self.logger.error(
-                f"FFmpeg encoding failed for '{name}' ({slug}) {mode_name} {label}: {exc.stderr or exc}"
+            if crop_height % 2 != 0:
+                if y1 < frame_height:
+                    y1 = min(frame_height, y1 + 1)
+                elif y0 > 0:
+                    y0 = max(0, y0 - 1)
+                else:
+                    self.logger.warning(
+                        f"Unable to expand height to even dimension for '{name}' ({slug}) {mode_name} {label}"
+                    )
+
+            crop_bounds = (x0, y0, x1, y1)
+            crop_width = x1 - x0
+            crop_height = y1 - y0
+
+            if (
+                self.auto_crop_transparent_frames
+                and (crop_width != frame_width or crop_height != frame_height)
+            ):
+                self.logger.info(
+                    f"Cropping '{name}' ({slug}) {mode_name} {label} to {crop_width}x{crop_height} "
+                    f"from original {frame_width}x{frame_height}"
+                )
+
+            total_frames = len(prepared_frames)
+            self.logger.info(
+                f"Streaming {total_frames} frames to FFmpeg for '{name}' ({slug}) {mode_name} {label}"
             )
-            raise
+
+            try:
+                frame_iter = self._frame_byte_generator(
+                    prepared_frames,
+                    mode_name,
+                    slug,
+                    name,
+                    label,
+                )
+                self._encode_with_ffmpeg(frame_iter, output_path, self.fps, crop_bounds)
+            except subprocess.CalledProcessError as exc:
+                self.logger.error(
+                    f"FFmpeg encoding failed for '{name}' ({slug}) {mode_name} {label}: {exc.stderr or exc}"
+                )
+                raise
 
         self.logger.info(
-            f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({valid_frames} frames)"
+            f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({total_frames} frames)"
         )
         
     def create_daily_timelapse(self, date: datetime = None):
