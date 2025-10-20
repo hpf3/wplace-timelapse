@@ -14,3 +14,6 @@ backup*
 output*
 *.log
 config.json
+
+# archive files
+historical_backfill/data

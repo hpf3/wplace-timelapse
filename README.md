@@ -149,6 +149,50 @@ backups/
 └── ...
 ```
 
+## Historical Backfill
+
+The `historical_backfill/` sub-project can pre-populate the `backups/` tree with
+frames that predate live capture by reusing snapshots from
+[`murolem/wplace-archives`](https://github.com/murolem/wplace-archives). The CLI
+mirrors the timelapse layout so the main pipeline can consume the backfilled
+sessions without further changes.
+
+```bash
+# Prepare the workspace
+python3 -m historical_backfill init
+
+# Inspect the latest archive releases and fetch one
+python3 -m historical_backfill download --list --count 5
+python3 -m historical_backfill download --tag world-2025-10-20T03-30-04.354Z
+
+# Optional checklist for manual download/extraction steps
+python3 -m historical_backfill plan --slug toulouse
+
+# Generate synthetic captures every 5 minutes between two timestamps
+python3 -m historical_backfill generate \
+  --slug toulouse \
+  --start 2025-10-19T18:30:00Z \
+  --end 2025-10-20T03:30:00Z \
+  --interval-minutes 5 \
+  --config config.json \
+  --config-slug toulouse \
+  --cleanup-archives
+
+# Dedicated Nemo helper (downloads, extracts, generates in one pass)
+bash historical_backfill/fetch_nemo_history.sh
+# Defaults target `/data/backups` for frames and `/data/cache` for temporary
+# archive storage; set the `HF_*` env vars described in the script to adjust.
+```
+
+Releases are mapped to frame timestamps by their capture time (encoded in the
+folder name). Provide a `GITHUB_TOKEN` environment variable if you hit GitHub
+rate limits while listing or downloading archives. When multiple frames reuse
+the same archive snapshot,
+placeholders are created to match the behaviour of the live collector.
+Add `--cleanup-archives` to the generate command to remove the multi-gigabyte
+tar parts after they are consumed (pair with `--archives-dir` if you store the
+downloads elsewhere).
+
 ## Finding Coordinates
 
 To monitor a specific region on WPlace:
