@@ -230,10 +230,12 @@ class TimelapseBackup:
         return session_dir / self._placeholder_filename(filename)
 
     def _write_placeholder(self, placeholder_path: Path, target_path: Path) -> bool:
-        """Create placeholder metadata referencing target tile path"""
+        """Create placeholder metadata marking tile reuse without hardcoding a file path."""
+        if not target_path.exists():
+            self.logger.warning(f"Creating placeholder for missing target tile: {target_path}")
         data = {
             "type": "placeholder",
-            "target": str(target_path.resolve()),
+            "version": 2,
             "created_at": datetime.utcnow().isoformat()
         }
         try:
@@ -244,17 +246,34 @@ class TimelapseBackup:
             self.logger.error(f"Failed to write placeholder {placeholder_path}: {exc}")
             return False
 
-    def _read_placeholder_target(self, placeholder_path: Path) -> Optional[Path]:
-        """Read target path from placeholder metadata"""
-        try:
-            with open(placeholder_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            target = data.get("target")
-            if target:
-                return Path(target)
-        except (OSError, json.JSONDecodeError, TypeError) as exc:
-            self.logger.warning(f"Invalid placeholder file {placeholder_path}: {exc}")
+    def _find_tile_in_sessions(
+        self,
+        sessions: Iterable[Path],
+        filename: str
+    ) -> Optional[Path]:
+        """Search older sessions for the first concrete PNG for a tile."""
+        for session in sessions:
+            candidate = session / filename
+            if candidate.exists():
+                return candidate
         return None
+
+    def _extract_slug_from_session(self, session_dir: Path) -> Optional[str]:
+        """Derive slug name from a session directory path relative to the backup root."""
+        backup_root = getattr(self, "backup_dir", None)
+        if backup_root is None:
+            return None
+        backup_root = Path(backup_root)
+
+        try:
+            relative = session_dir.relative_to(backup_root)
+        except ValueError:
+            return None
+
+        parts = relative.parts
+        if not parts:
+            return None
+        return parts[0]
 
     def _parse_session_datetime(self, session_dir: Path) -> Optional[datetime]:
         """Parse datetime from session directory path"""
@@ -302,7 +321,7 @@ class TimelapseBackup:
         filenames = {f"{x}_{y}.png" for x, y in coordinates}
         result: Dict[str, Path] = {}
 
-        for session_dir in prior_sessions:
+        for index, session_dir in enumerate(prior_sessions):
             remaining = filenames.difference(result.keys())
             if not remaining:
                 break
@@ -315,13 +334,22 @@ class TimelapseBackup:
 
                 placeholder_path = self._placeholder_path(session_dir, filename)
                 if placeholder_path.exists():
-                    target_path = self._read_placeholder_target(placeholder_path)
-                    if target_path and target_path.exists():
+                    target_path = self._find_tile_in_sessions(
+                        prior_sessions[index + 1 :],
+                        filename
+                    )
+                    if target_path is not None:
                         result[filename] = target_path
 
         return result
 
-    def resolve_tile_image_path(self, session_dir: Path, x: int, y: int) -> Optional[Path]:
+    def resolve_tile_image_path(
+        self,
+        session_dir: Path,
+        x: int,
+        y: int,
+        prior_sessions: Optional[List[Path]] = None
+    ) -> Optional[Path]:
         """Resolve actual image path for a tile, following placeholders if needed"""
         filename = f"{x}_{y}.png"
         candidate = session_dir / filename
@@ -330,11 +358,15 @@ class TimelapseBackup:
 
         placeholder_path = self._placeholder_path(session_dir, filename)
         if placeholder_path.exists():
-            target = self._read_placeholder_target(placeholder_path)
-            if target and target.exists():
-                return target
-            if target and not target.exists():
-                self.logger.warning(f"Placeholder target missing for {placeholder_path}: {target}")
+            if prior_sessions is not None:
+                sessions_to_search = prior_sessions
+            else:
+                slug = self._extract_slug_from_session(session_dir)
+                sessions_to_search = self.get_prior_sessions(slug, session_dir) if slug else []
+
+            target_path = self._find_tile_in_sessions(sessions_to_search, filename)
+            if target_path is not None:
+                return target_path
 
         return None
         
@@ -473,18 +505,32 @@ class TimelapseBackup:
                 f"Backup session completed: {total_successful}/{total_tiles} total tiles downloaded"
             )
                 
-    def create_composite_image(self, session_dir: Path, timelapse_config: Dict[str, Any]) -> Optional[CompositeFrame]:
+    def create_composite_image(
+        self,
+        session_dir: Path,
+        timelapse_config: Dict[str, Any],
+        tile_cache: Optional[Dict[Tuple[int, int], Path]] = None
+    ) -> Optional[CompositeFrame]:
         """Create a composite image from individual tiles and retain transparency."""
         coordinates = self.get_tile_coordinates(timelapse_config)
-        
+
+        slug = timelapse_config.get('slug')
+        if not slug:
+            slug = self._extract_slug_from_session(session_dir)
+        prior_sessions: List[Path] = self.get_prior_sessions(slug, session_dir) if slug else []
+
         # Determine grid dimensions
         x_coords = sorted(set(x for x, y in coordinates))
         y_coords = sorted(set(y for x, y in coordinates))
-        
+
         # Load first image to get tile dimensions
         first_tile = None
         for x, y in coordinates:
-            tile_path = self.resolve_tile_image_path(session_dir, x, y)
+            tile_path = self.resolve_tile_image_path(session_dir, x, y, prior_sessions)
+            if tile_path is None and tile_cache:
+                cached = tile_cache.get((x, y))
+                if cached and cached.exists():
+                    tile_path = cached
             if tile_path:
                 first_tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
                 if first_tile is not None and len(first_tile.shape) == 2:
@@ -508,15 +554,22 @@ class TimelapseBackup:
             dtype=np.uint8
         )
         alpha_mask = np.zeros((composite_height, composite_width), dtype=np.uint8)
-        
+
         for x, y in coordinates:
-            tile_path = self.resolve_tile_image_path(session_dir, x, y)
+            tile_path = self.resolve_tile_image_path(session_dir, x, y, prior_sessions)
+            if tile_path is None and tile_cache:
+                cached = tile_cache.get((x, y))
+                if cached and cached.exists():
+                    tile_path = cached
             if not tile_path:
                 continue
 
             tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
             if tile is None:
                 continue
+
+            if tile_cache is not None and tile_path.exists():
+                tile_cache[(x, y)] = tile_path
 
             if len(tile.shape) == 2:
                 tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
@@ -897,8 +950,9 @@ class TimelapseBackup:
         prep_total = len(session_dirs)
         prep_interval = max(1, prep_total // 20)
 
+        prep_tile_cache: Dict[Tuple[int, int], Path] = {}
         for index, session_dir in enumerate(session_dirs, start=1):
-            composite = self.create_composite_image(session_dir, timelapse_config)
+            composite = self.create_composite_image(session_dir, timelapse_config, prep_tile_cache)
             if composite is None:
                 if index % prep_interval == 0 or index == prep_total:
                     percent = (index / prep_total) * 100.0
@@ -995,10 +1049,11 @@ class TimelapseBackup:
         )
 
         def frame_generator() -> Iterable[bytes]:
+            tile_cache: Dict[Tuple[int, int], Path] = {}
             prev_composite_color: Optional[np.ndarray] = None
             progress_interval = max(1, total_frames // 20)
             for index, session_dir in enumerate(valid_session_dirs, start=1):
-                composite = self.create_composite_image(session_dir, timelapse_config)
+                composite = self.create_composite_image(session_dir, timelapse_config, tile_cache)
                 if composite is None:
                     continue
 
