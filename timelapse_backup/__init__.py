@@ -1,7 +1,5 @@
-"""timelapse_backup package.
+"""Public package interface for the timelapse backup system."""
 
-This module will expose the public facade after the refactor completes.
-"""
+from timelapse_backup.app import TimelapseBackup
 
-__all__: list[str] = []
-
+__all__ = ["TimelapseBackup"]

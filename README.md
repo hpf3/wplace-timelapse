@@ -70,6 +70,35 @@ A Python-based automated system that creates timelapse videos from [WPlace](http
    ```bash
    python main.py
    ```
+   The `main.py` entry point now delegates to the packaged facade so it stays
+   tiny and easy to reason about. Import `TimelapseBackup` from
+   `timelapse_backup` if you want to orchestrate backups from your own code.
+
+### Programmatic use
+
+```python
+from timelapse_backup import TimelapseBackup
+
+backup = TimelapseBackup()
+backup.create_daily_timelapse()
+```
+
+## Code Structure
+
+The refactored project centers around the `timelapse_backup` package:
+
+- `timelapse_backup.app` — houses the `TimelapseBackup` facade that wires all collaborators together.
+- `timelapse_backup.config` — dataclasses, validation, and JSON/.env loading utilities.
+- `timelapse_backup.logging_setup` — shared logging configuration helpers.
+- `timelapse_backup.sessions` — filesystem discovery helpers for session folders.
+- `timelapse_backup.tiles` — tile download logic and placeholder management.
+- `timelapse_backup.manifests` — manifest assembly and composite frame creation.
+- `timelapse_backup.rendering` — frame preparation, differential rendering, and FFmpeg streaming.
+- `timelapse_backup.stats` — statistics aggregation and human-readable report generation.
+- `timelapse_backup.scheduler` — APScheduler orchestration of recurring jobs.
+
+The lightweight `main.py` script simply imports the facade and calls `run()`,
+preserving the legacy command for existing automation while encouraging library usage.
 
 For detailed installation instructions, see [INSTALL.md](INSTALL.md).
 

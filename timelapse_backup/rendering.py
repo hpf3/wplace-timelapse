@@ -15,7 +15,8 @@ import numpy as np
 
 from timelapse_backup.config import DiffSettings
 from timelapse_backup.manifests import ManifestBuilder
-from timelapse_backup.models import CompositeFrame, FrameManifest, PreparedFrame, TimelapseStatsCollector
+from timelapse_backup.models import CompositeFrame, FrameManifest, PreparedFrame
+from timelapse_backup.stats import TimelapseStatsCollector
 
 
 class Renderer:

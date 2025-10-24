@@ -89,10 +89,10 @@ Test your installation:
 
 ```bash
 # Using uv
-uv run python main.py --help
+uv run python -c "from timelapse_backup import TimelapseBackup; print('TimelapseBackup facade ready')"
 
 # Using pip/venv
-python main.py --help
+python -c "from timelapse_backup import TimelapseBackup; print('TimelapseBackup facade ready')"
 ```
 
 ## Running the System
@@ -106,6 +106,19 @@ python main.py
 # - Download tiles every 5 minutes
 # - Create daily timelapses at midnight
 # - Log all activity to timelapse_backup.log
+```
+
+The CLI remains intentionally small; it instantiates the packaged `TimelapseBackup`
+facade and hands control to the scheduler. You can embed the same facade in your
+own tooling as shown below.
+
+### Programmatic Integration
+
+```python
+from timelapse_backup import TimelapseBackup
+
+backup = TimelapseBackup()
+backup.run()
 ```
 
 ### As a Service (Linux)

@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from main import TimelapseBackup
+from timelapse_backup import TimelapseBackup
 
 
 def test_placeholder_chain_falls_back_to_older_session(tmp_path):
