@@ -17,3 +17,6 @@ config.json
 
 # archive files
 historical_backfill/data
+
+# misc
+/plan.txt

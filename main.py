@@ -5,23 +5,43 @@ Automatically downloads tile images every 5 minutes and creates daily timelapses
 """
 
 import os
-import requests
 import logging
 import cv2
 import numpy as np
 import time
-import json
 import subprocess
-import shutil
 import uuid
 import threading
 import tempfile
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Iterable, Iterator, Union
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+from timelapse_backup.config import (
+    DiffSettings,
+    GlobalSettings,
+    TimelapseConfig,
+    _parse_background_color as config_parse_background_color,
+    _parse_bool as config_parse_bool,
+    _parse_positive_int as config_parse_positive_int,
+    load_config,
+)
+from timelapse_backup.logging_setup import configure_logging
+from timelapse_backup.models import (
+    CompositeFrame,
+    FrameManifest,
+    PreparedFrame,
+    TimelapseStatsCollector,
+)
+from timelapse_backup.sessions import (
+    get_all_sessions,
+    get_prior_sessions,
+    get_session_dirs_for_date,
+    parse_session_datetime,
+)
+from timelapse_backup.manifests import ManifestBuilder
+from timelapse_backup.rendering import Renderer
+from timelapse_backup.tiles import TileDownloader
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -29,460 +49,223 @@ from apscheduler.triggers.interval import IntervalTrigger
 # Load environment variables
 load_dotenv()
 
-
-@dataclass
-class CompositeFrame:
-    """Container for a rendered composite frame and its transparency mask."""
-    color: np.ndarray
-    alpha: np.ndarray
-
-
-@dataclass
-class FrameManifest:
-    """Resolved tile paths for a single frame."""
-    session_dir: Path
-    tile_paths: Dict[Tuple[int, int], Path]
-
-
-@dataclass
-class PreparedFrame:
-    """Prepared frame data persisted to temporary storage."""
-    index: int
-    session_dir: Path
-    temp_path: Optional[Path]
-    frame_shape: Optional[Tuple[int, int]]
-    alpha_bounds: Optional[Tuple[int, int, int, int]]
-
-
-@dataclass
-class TimelapseStatsCollector:
-    """Aggregate per-frame change statistics and timing metadata."""
-    frame_datetimes: List[Optional[datetime]]
-    records: List[Dict[str, Any]] = field(default_factory=list)
-
-    def record(self, frame_index: int, changed_pixels: Optional[int]) -> None:
-        """Record stats for a single frame."""
-        timestamp = None
-        if 0 <= frame_index < len(self.frame_datetimes):
-            timestamp = self.frame_datetimes[frame_index]
-        entry = {
-            "timestamp": timestamp,
-            "changed_pixels": None if changed_pixels is None else int(changed_pixels),
-        }
-        self.records.append(entry)
-
-    def summarize(
-        self,
-        gap_threshold: Optional[timedelta],
-        seconds_per_pixel: int = 30,
-    ) -> Dict[str, Any]:
-        """Produce a dictionary summary of collected statistics."""
-        rendered_frames = len(self.records)
-        total_changed_pixels = sum(
-            entry["changed_pixels"] or 0 for entry in self.records
-        )
-        frames_with_change = 0
-        frames_without_change = 0
-        frames_with_known_change = 0
-
-        for entry in self.records:
-            changed = entry["changed_pixels"]
-            if changed is None:
-                continue
-            frames_with_known_change += 1
-            if changed > 0:
-                frames_with_change += 1
-            else:
-                frames_without_change += 1
-        frames_excluded_from_stats = rendered_frames - frames_with_known_change
-        max_change_pixels = 0
-        max_change_timestamp: Optional[datetime] = None
-
-        for entry in self.records:
-            changed = entry["changed_pixels"]
-            if changed is None:
-                continue
-            if changed > max_change_pixels:
-                max_change_pixels = changed
-                max_change_timestamp = entry["timestamp"]
-
-        timestamps = [entry["timestamp"] for entry in self.records if entry["timestamp"] is not None]
-        start_timestamp = timestamps[0] if timestamps else None
-        end_timestamp = timestamps[-1] if timestamps else None
-        total_duration_seconds = (
-            (end_timestamp - start_timestamp).total_seconds()
-            if start_timestamp and end_timestamp and end_timestamp >= start_timestamp
-            else 0.0
-        )
-
-        intervals: List[float] = []
-        previous_ts: Optional[datetime] = None
-        for entry in self.records:
-            ts = entry["timestamp"]
-            if ts is None:
-                continue
-            if previous_ts is not None:
-                intervals.append(max(0.0, (ts - previous_ts).total_seconds()))
-            previous_ts = ts
-
-        if intervals:
-            average_interval = sum(intervals) / len(intervals)
-            min_interval = min(intervals)
-            max_interval = max(intervals)
-        else:
-            average_interval = min_interval = max_interval = 0.0
-
-        longest_idle_run_frames = 0
-        longest_idle_run_duration = 0.0
-        longest_idle_run_start: Optional[datetime] = None
-
-        current_run_frames = 0
-        current_run_duration = 0.0
-        current_run_start: Optional[datetime] = None
-        previous_in_run_timestamp: Optional[datetime] = None
-
-        for entry in self.records:
-            ts = entry["timestamp"]
-            changed = entry["changed_pixels"]
-            if changed == 0:
-                if current_run_frames == 0:
-                    current_run_start = ts
-                    current_run_duration = 0.0
-                else:
-                    if ts is not None and previous_in_run_timestamp is not None:
-                        current_run_duration += max(
-                            0.0, (ts - previous_in_run_timestamp).total_seconds()
-                        )
-                current_run_frames += 1
-
-                if current_run_frames > longest_idle_run_frames or (
-                    current_run_frames == longest_idle_run_frames
-                    and current_run_duration > longest_idle_run_duration
-                ):
-                    longest_idle_run_frames = current_run_frames
-                    longest_idle_run_duration = current_run_duration
-                    longest_idle_run_start = current_run_start
-            else:
-                current_run_frames = 0
-                current_run_duration = 0.0
-                current_run_start = None
-
-            if changed is not None:
-                previous_in_run_timestamp = ts
-            elif ts is not None:
-                previous_in_run_timestamp = ts
-
-        coverage_gaps: List[Dict[str, Any]] = []
-        if gap_threshold is not None and gap_threshold.total_seconds() > 0:
-            previous_ts = None
-            for entry in self.records:
-                ts = entry["timestamp"]
-                if ts is None:
-                    continue
-                if previous_ts is not None:
-                    delta = ts - previous_ts
-                    if delta > gap_threshold:
-                        coverage_gaps.append({
-                            "start": previous_ts,
-                            "end": ts,
-                            "duration_seconds": delta.total_seconds(),
-                        })
-                previous_ts = ts
-
-        coverage_gap_summary: Optional[Dict[str, Any]] = None
-        if coverage_gaps:
-            sorted_gaps = sorted(
-                coverage_gaps,
-                key=lambda gap: gap["duration_seconds"],
-                reverse=True,
-            )
-            coverage_gap_summary = {
-                "count": len(coverage_gaps),
-                "max_duration_seconds": sorted_gaps[0]["duration_seconds"],
-                "examples": [
-                    {
-                        "start": gap["start"].isoformat() if gap["start"] else None,
-                        "end": gap["end"].isoformat() if gap["end"] else None,
-                        "duration_seconds": gap["duration_seconds"],
-                    }
-                    for gap in sorted_gaps[:3]
-                ],
-            }
-
-        total_time_invested_seconds = total_changed_pixels * seconds_per_pixel
-        average_pixels_per_frame = (
-            total_changed_pixels / rendered_frames if rendered_frames else 0.0
-        )
-        average_time_per_frame_seconds = (
-            total_time_invested_seconds / rendered_frames if rendered_frames else 0.0
-        )
-
-        return {
-            "rendered_frames": rendered_frames,
-            "frames_with_change": frames_with_change,
-            "frames_without_change": frames_without_change,
-            "frames_excluded_from_stats": frames_excluded_from_stats,
-            "total_changed_pixels": total_changed_pixels,
-            "average_pixels_per_frame": average_pixels_per_frame,
-            "total_time_invested_seconds": total_time_invested_seconds,
-            "average_time_per_frame_seconds": average_time_per_frame_seconds,
-            "max_change_pixels": max_change_pixels,
-            "max_change_frame_timestamp": (
-                max_change_timestamp.isoformat() if max_change_timestamp else None
-            ),
-            "start_timestamp": start_timestamp.isoformat() if start_timestamp else None,
-            "end_timestamp": end_timestamp.isoformat() if end_timestamp else None,
-            "total_duration_seconds": total_duration_seconds,
-            "capture_interval_seconds": {
-                "average": average_interval,
-                "minimum": min_interval,
-                "maximum": max_interval,
-            },
-            "longest_idle_run_frames": longest_idle_run_frames,
-            "longest_idle_run_duration_seconds": longest_idle_run_duration,
-            "longest_idle_run_start_timestamp": (
-                longest_idle_run_start.isoformat() if longest_idle_run_start else None
-            ),
-            "coverage_gaps": coverage_gap_summary,
-        }
-
 class TimelapseBackup:
     PLACEHOLDER_SUFFIX = '.placeholder'
 
     def __init__(self, config_file: str = 'config.json'):
         self.config_file = config_file
-        self.reporting_enabled: bool = True
-        self.coverage_gap_multiplier: Optional[float] = None
-        self.seconds_per_pixel: int = 30
+        self.config_path = Path(config_file)
         # Historical data imported prior to this cutoff is treated as baseline-only.
         self.historical_cutoff: Optional[datetime] = datetime(2025, 10, 13)
-        self.config = self.load_configuration()
-        
+
+        config_data = load_config(self.config_path)
+        self.config_data = config_data
+        self._apply_global_settings(config_data.global_settings)
+        self.config = {
+            'timelapses': [self._timelapse_to_dict(timelapse) for timelapse in config_data.timelapses],
+            'global_settings': self._global_settings_to_dict(config_data.global_settings),
+        }
+
         # Setup logging
         self.setup_logging()
-        
+
+        # Initialize tile downloader helper
+        self._get_tile_downloader()
+
         # Create directories
         self.backup_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
-        
-    def load_configuration(self) -> Dict[str, Any]:
-        """Load configuration from JSON file or fall back to .env"""
-        config_path = Path(self.config_file)
-        
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-                
-            # Set properties from config
-            settings = config['global_settings']
-            self.base_url = settings.get('base_url', 'https://backend.wplace.live/files/s0/tiles')
-            self.backup_interval = settings.get('backup_interval_minutes', 5)
-            self.backup_dir = Path(settings.get('backup_dir', 'backups'))
-            self.output_dir = Path(settings.get('output_dir', 'output'))
-            self.request_delay = settings.get('request_delay', 0.5)
-            self.fps = settings.get('timelapse_fps', 10)
-            self.quality = settings.get('timelapse_quality', 23)
-            self.background_color = self._parse_background_color(settings.get('background_color', [0, 0, 0]))
-            self.auto_crop_transparent_frames = self._parse_bool(
-                settings.get('auto_crop_transparent_frames', True),
-                True
-            )
-            default_workers = max(1, min(4, os.cpu_count() or 1))
-            self.frame_prep_workers = self._parse_positive_int(
-                settings.get('frame_prep_workers', default_workers),
-                default_workers
-            )
-            
-            # Differential settings
-            diff_settings = settings.get('diff_settings', {})
-            self.diff_threshold = diff_settings.get('threshold', 10)
-            self.diff_visualization = diff_settings.get('visualization', 'colored')
-            self.diff_fade_frames = diff_settings.get('fade_frames', 3)
-            self.diff_enhancement_factor = diff_settings.get('enhancement_factor', 2.0)
-            self._apply_reporting_settings(settings)
-            
-            return config
-        else:
-            # Fall back to .env configuration (backward compatibility)
-            self.base_url = os.getenv('BASE_URL', 'https://backend.wplace.live/files/s0/tiles')
-            self.backup_interval = int(os.getenv('BACKUP_INTERVAL_MINUTES', 5))
-            self.backup_dir = Path(os.getenv('BACKUP_DIR', 'backups'))
-            self.output_dir = Path(os.getenv('TIMELAPSE_DIR', 'timelapses'))
-            self.request_delay = float(os.getenv('REQUEST_DELAY', 0.5))
-            self.fps = int(os.getenv('TIMELAPSE_FPS', 10))
-            self.quality = int(os.getenv('TIMELAPSE_QUALITY', 23))
-            self.background_color = (0, 0, 0)
-            self.auto_crop_transparent_frames = self._parse_bool(
-                os.getenv('AUTO_CROP_TRANSPARENT_FRAMES', 'true'),
-                True
-            )
-            default_workers = max(1, min(4, os.cpu_count() or 1))
-            self.frame_prep_workers = self._parse_positive_int(
-                os.getenv('FRAME_PREP_WORKERS'),
-                default_workers
-            )
-            
-            # Differential settings (defaults)
-            self.diff_threshold = 10
-            self.diff_visualization = 'colored'
-            self.diff_fade_frames = 3
-            self.diff_enhancement_factor = 2.0
-            legacy_settings = {
-                'reporting': {}
+
+    def _apply_global_settings(self, settings: GlobalSettings) -> None:
+        """Populate instance attributes from parsed global settings."""
+        self.base_url = settings.base_url
+        self.backup_interval = settings.backup_interval_minutes
+        self.backup_dir = settings.backup_dir
+        self.output_dir = settings.output_dir
+        self.request_delay = settings.request_delay
+        self.fps = settings.timelapse_fps
+        self.quality = settings.timelapse_quality
+        self.background_color = settings.background_color
+        self.auto_crop_transparent_frames = settings.auto_crop_transparent_frames
+        self.frame_prep_workers = settings.frame_prep_workers
+
+        diff = settings.diff_settings
+        self.diff_threshold = diff.threshold
+        self.diff_visualization = diff.visualization
+        self.diff_fade_frames = diff.fade_frames
+        self.diff_enhancement_factor = diff.enhancement_factor
+
+        reporting = settings.reporting
+        self.reporting_enabled = reporting.enable_stats_file
+        self.seconds_per_pixel = reporting.seconds_per_pixel
+        self.coverage_gap_multiplier = reporting.coverage_gap_multiplier
+
+    def _timelapse_to_dict(self, config: TimelapseConfig) -> Dict[str, Any]:
+        """Convert a dataclass timelapse config into the legacy dictionary shape."""
+        coordinates = {
+            'xmin': config.coordinates.xmin,
+            'xmax': config.coordinates.xmax,
+            'ymin': config.coordinates.ymin,
+            'ymax': config.coordinates.ymax,
+        }
+        modes: Dict[str, Dict[str, Any]] = {}
+        for name, mode in config.timelapse_modes.items():
+            modes[name] = {
+                'enabled': mode.enabled,
+                'suffix': mode.suffix,
+                'create_full_timelapse': mode.create_full_timelapse,
             }
-            self._apply_reporting_settings(legacy_settings)
-            
-            # Create legacy single timelapse config
-            return {
-                'timelapses': [{
-                    'slug': 'default',
-                    'name': 'Default Timelapse',
-                    'coordinates': {
-                        'xmin': int(os.getenv('XMIN', 1031)),
-                        'xmax': int(os.getenv('XMAX', 1032)),
-                        'ymin': int(os.getenv('YMIN', 747)),
-                        'ymax': int(os.getenv('YMAX', 748))
-                    },
-                    'enabled': True
-                }],
-                'global_settings': {
-                    'base_url': self.base_url,
-                    'backup_interval_minutes': self.backup_interval,
-                    'backup_dir': str(self.backup_dir),
-                    'output_dir': str(self.output_dir),
-                    'request_delay': self.request_delay,
-                    'timelapse_fps': self.fps,
-                    'timelapse_quality': self.quality,
-                    'background_color': list(self.background_color),
-                    'auto_crop_transparent_frames': self.auto_crop_transparent_frames
-                }
-            }
+        return {
+            'slug': config.slug,
+            'name': config.name,
+            'description': config.description,
+            'coordinates': coordinates,
+            'enabled': config.enabled,
+            'timelapse_modes': modes,
+        }
 
-    def _apply_reporting_settings(self, settings: Dict[str, Any]) -> None:
-        """Configure reporting-related settings with sensible defaults."""
-        reporting = settings.get('reporting', {}) if isinstance(settings, dict) else {}
-
-        enable_stats = reporting.get('enable_stats_file')
-        if enable_stats is None:
-            self.reporting_enabled = True
-        else:
-            self.reporting_enabled = self._parse_bool(enable_stats, True)
-
-        seconds_per_pixel = reporting.get('seconds_per_pixel')
-        if seconds_per_pixel is not None:
-            try:
-                parsed_seconds = int(seconds_per_pixel)
-                if parsed_seconds > 0:
-                    self.seconds_per_pixel = parsed_seconds
-            except (TypeError, ValueError):
-                pass
-
-        gap_multiplier = reporting.get('coverage_gap_multiplier')
-        if gap_multiplier is None:
-            self.coverage_gap_multiplier = None
-        else:
-            try:
-                parsed_multiplier = float(gap_multiplier)
-            except (TypeError, ValueError):
-                parsed_multiplier = None
-            self.coverage_gap_multiplier = (
-                parsed_multiplier if parsed_multiplier and parsed_multiplier > 0 else None
-            )
+    def _global_settings_to_dict(self, settings: GlobalSettings) -> Dict[str, Any]:
+        """Convert parsed global settings into a legacy-compatible dictionary."""
+        return {
+            'base_url': settings.base_url,
+            'backup_interval_minutes': settings.backup_interval_minutes,
+            'backup_dir': str(settings.backup_dir),
+            'output_dir': str(settings.output_dir),
+            'request_delay': settings.request_delay,
+            'timelapse_fps': settings.timelapse_fps,
+            'timelapse_quality': settings.timelapse_quality,
+            'background_color': list(settings.background_color),
+            'auto_crop_transparent_frames': settings.auto_crop_transparent_frames,
+            'frame_prep_workers': settings.frame_prep_workers,
+            'diff_settings': {
+                'threshold': settings.diff_settings.threshold,
+                'visualization': settings.diff_settings.visualization,
+                'fade_frames': settings.diff_settings.fade_frames,
+                'enhancement_factor': settings.diff_settings.enhancement_factor,
+            },
+            'reporting': {
+                'enable_stats_file': settings.reporting.enable_stats_file,
+                'seconds_per_pixel': settings.reporting.seconds_per_pixel,
+                'coverage_gap_multiplier': settings.reporting.coverage_gap_multiplier,
+            },
+        }
 
     def _parse_background_color(self, value: Any) -> Tuple[int, int, int]:
-        """Parse and clamp background color definition"""
-        default = (0, 0, 0)
-
-        def _clamp_triplet(triplet: Any) -> Optional[Tuple[int, int, int]]:
-            if not isinstance(triplet, (list, tuple)) or len(triplet) != 3:
-                return None
-            try:
-                return tuple(
-                    max(0, min(255, int(channel)))
-                    for channel in triplet
-                )
-            except (TypeError, ValueError):
-                return None
-
-        def _to_bgr(channels: Tuple[int, int, int], order: Optional[str]) -> Optional[Tuple[int, int, int]]:
-            color_order = (order or 'rgb').lower()
-            if color_order == 'bgr':
-                return channels
-            if color_order == 'rgb':
-                return (channels[2], channels[1], channels[0])
-            return None
-
-        if isinstance(value, dict):
-            if 'hex' in value and isinstance(value['hex'], str):
-                return self._parse_background_color(value['hex'])
-            if 'value' in value:
-                channels = _clamp_triplet(value['value'])
-                if channels is None:
-                    return default
-                bgr = _to_bgr(channels, value.get('order') or value.get('color_space'))
-                if bgr is not None:
-                    return bgr
-                return default
-
-        if isinstance(value, (list, tuple)):
-            channels = _clamp_triplet(value)
-            if channels is None:
-                return default
-            bgr = _to_bgr(channels, 'rgb')
-            if bgr is not None:
-                return bgr
-            return default
-
-        if isinstance(value, str):
-            hex_value = value.lstrip('#')
-            if len(hex_value) == 6:
-                try:
-                    r = int(hex_value[0:2], 16)
-                    g = int(hex_value[2:4], 16)
-                    b = int(hex_value[4:6], 16)
-                    # Convert from RGB string to BGR tuple used by OpenCV
-                    return (b, g, r)
-                except ValueError:
-                    return default
-
-        return default
+        """Backward-compatible wrapper for the background color parser."""
+        return config_parse_background_color(value)
 
     @staticmethod
     def _parse_bool(value: Any, default: bool) -> bool:
-        """Parse truthy/falsy values from multiple input types."""
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in {'1', 'true', 'yes', 'on'}
-        if isinstance(value, (int, float)):
-            return value != 0
-        return default
+        """Backward-compatible wrapper for boolean parsing."""
+        return config_parse_bool(value, default)
 
     @staticmethod
     def _parse_positive_int(value: Any, default: int) -> int:
-        """Parse a positive integer with fallback to default."""
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return default
-        return parsed if parsed > 0 else default
-    
+        """Backward-compatible wrapper for positive integer parsing."""
+        return config_parse_positive_int(value, default)
+
+    def get_prior_sessions(self, slug: str, current_session: Path) -> List[Path]:
+        """Delegate to session helper for compatibility."""
+        backup_root = getattr(self, "backup_dir", None)
+        if backup_root is None or not slug:
+            return []
+        return get_prior_sessions(backup_root, slug, current_session)
+
+    def get_session_dirs_for_date(self, slug: str, date_str: str) -> List[Path]:
+        """Delegate to session helper for compatibility."""
+        backup_root = getattr(self, "backup_dir", None)
+        if backup_root is None:
+            return []
+        return get_session_dirs_for_date(backup_root, slug, date_str)
+
+    def get_all_sessions(self, slug: str) -> List[Path]:
+        """Delegate to session helper for compatibility."""
+        backup_root = getattr(self, "backup_dir", None)
+        if backup_root is None:
+            return []
+        return get_all_sessions(backup_root, slug)
+
+    def _get_tile_downloader(self) -> TileDownloader:
+        if not hasattr(self, "_tile_downloader"):
+            logger = getattr(self, "logger", logging.getLogger(__name__))
+            base_url = getattr(self, "base_url", "")
+            self._tile_downloader = TileDownloader(
+                base_url=base_url,
+                logger=logger,
+                placeholder_suffix=self.PLACEHOLDER_SUFFIX,
+            )
+        return self._tile_downloader
+
+    def _get_manifest_builder(self) -> ManifestBuilder:
+        tile_downloader = self._get_tile_downloader()
+        current_logger = getattr(self, "logger", logging.getLogger(__name__))
+        builder = getattr(self, "_manifest_builder", None)
+        if (
+            builder is None
+            or builder.tile_downloader is not tile_downloader
+            or builder.background_color != self.background_color
+            or builder.logger is not current_logger
+        ):
+            builder = ManifestBuilder(
+                tile_downloader=tile_downloader,
+                background_color=self.background_color,
+                logger=current_logger,
+            )
+            self._manifest_builder = builder
+        return builder
+
+    def _placeholder_filename(self, filename: str) -> str:
+        return self._get_tile_downloader().placeholder_filename(filename)
+
+    def _placeholder_path(self, session_dir: Path, filename: str) -> Path:
+        return self._get_tile_downloader().placeholder_path(session_dir, filename)
+
+    def _write_placeholder(self, placeholder_path: Path, target_path: Path) -> bool:
+        return self._get_tile_downloader().write_placeholder(placeholder_path, target_path)
+
+    def _get_renderer(self) -> Renderer:
+        builder = self._get_manifest_builder()
+        current_logger = getattr(self, "logger", logging.getLogger(__name__))
+
+        if hasattr(self, "config_data"):
+            diff_settings = self.config_data.global_settings.diff_settings
+        else:
+            diff_settings = DiffSettings(
+                threshold=getattr(self, "diff_threshold", 10),
+                visualization=getattr(self, "diff_visualization", "colored"),
+                fade_frames=getattr(self, "diff_fade_frames", 3),
+                enhancement_factor=getattr(self, "diff_enhancement_factor", 2.0),
+            )
+
+        renderer = getattr(self, "_renderer", None)
+        if (
+            renderer is None
+            or renderer.manifest_builder is not builder
+            or renderer.logger is not current_logger
+            or renderer.frame_prep_workers != max(1, getattr(self, "frame_prep_workers", 1))
+            or renderer.auto_crop_transparent_frames != getattr(self, "auto_crop_transparent_frames", True)
+            or renderer.diff_settings != diff_settings
+            or renderer.historical_cutoff != getattr(self, "historical_cutoff", None)
+        ):
+            renderer = Renderer(
+                manifest_builder=builder,
+                logger=current_logger,
+                frame_prep_workers=getattr(self, "frame_prep_workers", 1),
+                auto_crop_transparent_frames=getattr(self, "auto_crop_transparent_frames", True),
+                diff_settings=diff_settings,
+                historical_cutoff=getattr(self, "historical_cutoff", None),
+            )
+            self._renderer = renderer
+        return renderer
+
+
     def get_enabled_timelapses(self) -> List[Dict[str, Any]]:
         """Get list of enabled timelapse configurations"""
         return [tl for tl in self.config['timelapses'] if tl.get('enabled', True)]
         
     def setup_logging(self):
         """Setup logging configuration"""
-        log_format = '%(asctime)s - %(levelname)s - %(message)s'
-        logging.basicConfig(
-            level=logging.INFO,
-            format=log_format,
-            handlers=[
-                logging.FileHandler('timelapse_backup.log'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        self.logger = configure_logging(logger_name=__name__)
         
     def get_tile_coordinates(self, timelapse_config: Dict[str, Any]) -> List[Tuple[int, int]]:
         """Generate list of tile coordinates to download for a specific timelapse"""
@@ -493,127 +276,20 @@ class TimelapseBackup:
                 coordinates.append((x, y))
         return coordinates
     
-    def _placeholder_filename(self, filename: str) -> str:
-        """Derive placeholder filename for a tile"""
-        return f"{Path(filename).stem}{self.PLACEHOLDER_SUFFIX}"
 
-    def _placeholder_path(self, session_dir: Path, filename: str) -> Path:
-        """Return path to placeholder file for given tile filename"""
-        return session_dir / self._placeholder_filename(filename)
 
-    def _write_placeholder(self, placeholder_path: Path, target_path: Path) -> bool:
-        """Create placeholder metadata marking tile reuse without hardcoding a file path."""
-        if not target_path.exists():
-            self.logger.warning(f"Creating placeholder for missing target tile: {target_path}")
-        data = {
-            "type": "placeholder",
-            "version": 2,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        try:
-            with open(placeholder_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-            return True
-        except OSError as exc:
-            self.logger.error(f"Failed to write placeholder {placeholder_path}: {exc}")
-            return False
 
-    def _find_tile_in_sessions(
-        self,
-        sessions: Iterable[Path],
-        filename: str
-    ) -> Optional[Path]:
-        """Search older sessions for the first concrete PNG for a tile."""
-        for session in sessions:
-            candidate = session / filename
-            if candidate.exists():
-                return candidate
-        return None
-
-    def _extract_slug_from_session(self, session_dir: Path) -> Optional[str]:
-        """Derive slug name from a session directory path relative to the backup root."""
-        backup_root = getattr(self, "backup_dir", None)
-        if backup_root is None:
-            return None
-        backup_root = Path(backup_root)
-
-        try:
-            relative = session_dir.relative_to(backup_root)
-        except ValueError:
-            return None
-
-        parts = relative.parts
-        if not parts:
-            return None
-        return parts[0]
-
-    def _parse_session_datetime(self, session_dir: Path) -> Optional[datetime]:
-        """Parse datetime from session directory path"""
-        try:
-            return datetime.strptime(
-                f"{session_dir.parent.name} {session_dir.name}",
-                "%Y-%m-%d %H-%M-%S"
-            )
-        except ValueError:
-            return None
-
-    def get_prior_sessions(self, slug: str, current_session: Path) -> List[Path]:
-        """Get list of prior session directories ordered from newest to oldest"""
-        slug_dir = self.backup_dir / slug
-        if not slug_dir.exists():
-            return []
-
-        current_dt = self._parse_session_datetime(current_session)
-        sessions: List[Tuple[datetime, Path]] = []
-
-        for date_dir in slug_dir.iterdir():
-            if not date_dir.is_dir():
-                continue
-            for time_dir in date_dir.iterdir():
-                if not time_dir.is_dir() or time_dir == current_session:
-                    continue
-                session_dt = self._parse_session_datetime(time_dir)
-                if session_dt is None:
-                    continue
-                if current_dt is not None and session_dt >= current_dt:
-                    continue
-                sessions.append((session_dt, time_dir))
-
-        sessions.sort(key=lambda item: item[0], reverse=True)
-        return [path for _, path in sessions]
 
     def build_previous_tile_map(
         self,
-        prior_sessions: List[Path],
-        coordinates: List[Tuple[int, int]]
+        prior_sessions: Iterable[Path],
+        coordinates: Iterable[Tuple[int, int]],
     ) -> Dict[str, Path]:
-        """
-        Build map of tile filename to the most recent available PNG path from prior sessions.
-        """
-        filenames = {f"{x}_{y}.png" for x, y in coordinates}
-        result: Dict[str, Path] = {}
-
-        for index, session_dir in enumerate(prior_sessions):
-            remaining = filenames.difference(result.keys())
-            if not remaining:
-                break
-
-            for filename in list(remaining):
-                direct_path = session_dir / filename
-                if direct_path.exists():
-                    result[filename] = direct_path
-                    continue
-
-                placeholder_path = self._placeholder_path(session_dir, filename)
-                if placeholder_path.exists():
-                    target_path = self._find_tile_in_sessions(
-                        prior_sessions[index + 1 :],
-                        filename
-                    )
-                    if target_path is not None:
-                        result[filename] = target_path
-
-        return result
+        """Delegate to tile downloader for compatibility."""
+        return self._get_tile_downloader().build_previous_tile_map(
+            prior_sessions,
+            coordinates,
+        )
 
     def resolve_tile_image_path(
         self,
@@ -623,24 +299,14 @@ class TimelapseBackup:
         prior_sessions: Optional[List[Path]] = None
     ) -> Optional[Path]:
         """Resolve actual image path for a tile, following placeholders if needed"""
-        filename = f"{x}_{y}.png"
-        candidate = session_dir / filename
-        if candidate.exists():
-            return candidate
-
-        placeholder_path = self._placeholder_path(session_dir, filename)
-        if placeholder_path.exists():
-            if prior_sessions is not None:
-                sessions_to_search = prior_sessions
-            else:
-                slug = self._extract_slug_from_session(session_dir)
-                sessions_to_search = self.get_prior_sessions(slug, session_dir) if slug else []
-
-            target_path = self._find_tile_in_sessions(sessions_to_search, filename)
-            if target_path is not None:
-                return target_path
-
-        return None
+        backup_root = getattr(self, "backup_dir", None)
+        return self._get_tile_downloader().resolve_tile_image_path(
+            session_dir,
+            x,
+            y,
+            prior_sessions=prior_sessions,
+            backup_root=backup_root,
+        )
         
     def download_tile(
         self,
@@ -655,47 +321,13 @@ class TimelapseBackup:
         Returns:
             Tuple[bool, bool]: (success flag, placeholder created flag)
         """
-        try:
-            url = f"{self.base_url}/{x}/{y}.png"
-            filename = f"{x}_{y}.png"
-            filepath = session_dir / filename
-
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-
-            content = response.content
-            previous_path = previous_tile_map.get(filename)
-
-            if previous_path and previous_path.exists():
-                try:
-                    if previous_path.read_bytes() == content:
-                        placeholder_path = self._placeholder_path(session_dir, filename)
-                        if self._write_placeholder(placeholder_path, previous_path):
-                            self.logger.debug(
-                                f"Skipped duplicate tile {slug} {x},{y}; placeholder -> {previous_path}"
-                            )
-                            return True, True
-                        else:
-                            self.logger.debug(
-                                f"Placeholder creation failed for {slug} {x},{y}; saving tile to disk"
-                            )
-                except OSError as exc:
-                    self.logger.warning(f"Failed to read previous tile {previous_path}: {exc}")
-
-            with open(filepath, 'wb') as f:
-                f.write(content)
-
-            # Ensure no stale placeholder remains
-            placeholder_path = self._placeholder_path(session_dir, filename)
-            if placeholder_path.exists():
-                placeholder_path.unlink(missing_ok=True)
-
-            self.logger.debug(f"Downloaded tile {slug} {x},{y} to {filepath}")
-            return True, False
-
-        except Exception as e:
-            self.logger.error(f"Failed to download tile {x},{y}: {e}")
-            return False, False
+        return self._get_tile_downloader().download_tile(
+            slug,
+            x,
+            y,
+            session_dir,
+            previous_tile_map,
+        )
             
     def backup_tiles(self):
         """Backup all tiles for current timestamp for all enabled timelapses"""
@@ -719,7 +351,7 @@ class TimelapseBackup:
             session_dir.mkdir(parents=True, exist_ok=True)
             
             coordinates = self.get_tile_coordinates(timelapse)
-            prior_sessions = self.get_prior_sessions(slug, session_dir)
+            prior_sessions = get_prior_sessions(self.backup_dir, slug, session_dir)
             previous_tile_map = self.build_previous_tile_map(prior_sessions, coordinates)
             successful_downloads = 0
             duplicate_tiles = 0
@@ -786,34 +418,16 @@ class TimelapseBackup:
         prior_sessions: Optional[List[Path]] = None,
     ) -> Optional[FrameManifest]:
         """Resolve tile paths for a session using existing fallback logic."""
-        slug = timelapse_config.get('slug')
-        if not slug:
-            slug = self._extract_slug_from_session(session_dir)
-
-        if prior_sessions is None:
-            prior_sessions = self.get_prior_sessions(slug, session_dir) if slug else []
-
-        manifest_tile_cache = tile_cache if tile_cache is not None else {}
-        tile_paths: Dict[Tuple[int, int], Path] = {}
-
-        for x, y in coordinates:
-            tile_path = self.resolve_tile_image_path(session_dir, x, y, prior_sessions)
-            if tile_path is None and tile_cache is not None:
-                cached = manifest_tile_cache.get((x, y))
-                if cached and cached.exists():
-                    tile_path = cached
-
-            if tile_path is None or not tile_path.exists():
-                continue
-
-            if tile_cache is not None:
-                manifest_tile_cache[(x, y)] = tile_path
-            tile_paths[(x, y)] = tile_path
-
-        if not tile_paths:
-            return None
-
-        return FrameManifest(session_dir=session_dir, tile_paths=tile_paths)
+        backup_root = getattr(self, "backup_dir", None)
+        builder = self._get_manifest_builder()
+        return builder.build_manifest_for_session(
+            session_dir,
+            coordinates,
+            backup_root=backup_root,
+            slug=timelapse_config.get('slug'),
+            prior_sessions=prior_sessions,
+            tile_cache=tile_cache,
+        )
 
     def _compose_frame_from_manifest(
         self,
@@ -825,93 +439,7 @@ class TimelapseBackup:
         y_index_map: Dict[int, int],
     ) -> Optional[CompositeFrame]:
         """Compose a frame using tile paths resolved in a manifest."""
-        first_tile: Optional[np.ndarray] = None
-        for x, y in coordinates:
-            tile_path = manifest.tile_paths.get((x, y))
-            if not tile_path or not tile_path.exists():
-                continue
-            tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
-            if tile is None:
-                continue
-            if len(tile.shape) == 2:
-                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
-            elif tile.shape[2] == 1:
-                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
-            elif tile.shape[2] == 3:
-                opaque_alpha = np.full((tile.shape[0], tile.shape[1], 1), 255, dtype=tile.dtype)
-                tile = np.concatenate((tile, opaque_alpha), axis=2)
-            elif tile.shape[2] != 4:
-                continue
-            first_tile = tile
-            break
-
-        if first_tile is None:
-            return None
-
-        tile_height, tile_width = first_tile.shape[:2]
-        composite_height = len(y_coords) * tile_height
-        composite_width = len(x_coords) * tile_width
-        composite = np.full(
-            (composite_height, composite_width, 3),
-            self.background_color,
-            dtype=np.uint8,
-        )
-        alpha_mask = np.zeros((composite_height, composite_width), dtype=np.uint8)
-
-        for x, y in coordinates:
-            tile_path = manifest.tile_paths.get((x, y))
-            if not tile_path or not tile_path.exists():
-                continue
-
-            tile = cv2.imread(str(tile_path), cv2.IMREAD_UNCHANGED)
-            if tile is None:
-                continue
-
-            if len(tile.shape) == 2:
-                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
-            elif tile.shape[2] == 1:
-                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGRA)
-            elif tile.shape[2] == 3:
-                opaque_alpha = np.full((tile.shape[0], tile.shape[1], 1), 255, dtype=tile.dtype)
-                tile = np.concatenate((tile, opaque_alpha), axis=2)
-            elif tile.shape[2] != 4:
-                continue
-
-            x_idx = x_index_map.get(x)
-            y_idx = y_index_map.get(y)
-            if x_idx is None or y_idx is None:
-                continue
-
-            start_y = y_idx * tile_height
-            end_y = start_y + tile_height
-            start_x = x_idx * tile_width
-            end_x = start_x + tile_width
-
-            region = composite[start_y:end_y, start_x:end_x].astype(np.float32)
-            region_alpha = alpha_mask[start_y:end_y, start_x:end_x].astype(np.float32) / 255.0
-
-            tile_rgb = tile[:, :, :3].astype(np.float32)
-            tile_alpha = tile[:, :, 3].astype(np.float32) / 255.0
-
-            inverse_tile_alpha = 1.0 - tile_alpha
-            out_alpha = tile_alpha + region_alpha * inverse_tile_alpha
-
-            combined_color = (
-                tile_rgb * tile_alpha[..., None]
-                + region * (region_alpha * inverse_tile_alpha)[..., None]
-            )
-
-            divisor = np.maximum(out_alpha[..., None], 1e-6)
-            out_color = combined_color / divisor
-
-            zero_alpha_mask = out_alpha <= 0
-            if np.any(zero_alpha_mask):
-                out_color[zero_alpha_mask] = self.background_color
-
-            composite[start_y:end_y, start_x:end_x] = np.clip(out_color, 0, 255).astype(np.uint8)
-            alpha_mask[start_y:end_y, start_x:end_x] = np.clip(out_alpha * 255.0, 0, 255).astype(np.uint8)
-
-        return CompositeFrame(color=composite, alpha=alpha_mask)
+        return self._get_manifest_builder().compose_frame(manifest, coordinates)
 
     def create_composite_image(
         self,
@@ -921,80 +449,17 @@ class TimelapseBackup:
     ) -> Optional[CompositeFrame]:
         """Create a composite image from individual tiles and retain transparency."""
         coordinates = self.get_tile_coordinates(timelapse_config)
-
-        manifest = self._build_manifest_for_session(
+        builder = self._get_manifest_builder()
+        backup_root = getattr(self, "backup_dir", None)
+        return builder.create_composite_image(
             session_dir,
-            timelapse_config,
             coordinates,
-            tile_cache,
-        )
-        if manifest is None:
-            return None
-
-        x_coords = sorted(set(x for x, y in coordinates))
-        y_coords = sorted(set(y for x, y in coordinates))
-        x_index_map = {value: idx for idx, value in enumerate(x_coords)}
-        y_index_map = {value: idx for idx, value in enumerate(y_coords)}
-
-        return self._compose_frame_from_manifest(
-            manifest,
-            coordinates,
-            x_coords,
-            y_coords,
-            x_index_map,
-            y_index_map,
+            backup_root=backup_root,
+            slug=timelapse_config.get('slug'),
+            tile_cache=tile_cache,
         )
         
-    def _update_content_bounds(
-        self,
-        alpha_mask: np.ndarray,
-        bounds: Optional[Tuple[int, int, int, int]]
-    ) -> Optional[Tuple[int, int, int, int]]:
-        """Expand a running bounding box using the provided alpha mask."""
-        if alpha_mask is None or not np.any(alpha_mask):
-            return bounds
 
-        # Ensure mask is uint8 for OpenCV operations
-        if alpha_mask.dtype != np.uint8:
-            mask = alpha_mask.astype(np.uint8)
-        else:
-            mask = alpha_mask
-
-        coords = cv2.findNonZero(mask)
-        if coords is None:
-            return bounds
-
-        x, y, w, h = cv2.boundingRect(coords)
-        updated = (x, y, x + w, y + h)
-
-        if bounds is None:
-            return updated
-
-        return (
-            min(bounds[0], updated[0]),
-            min(bounds[1], updated[1]),
-            max(bounds[2], updated[2]),
-            max(bounds[3], updated[3])
-        )
-
-    @staticmethod
-    def _merge_bounds(
-        current: Optional[Tuple[int, int, int, int]],
-        new: Optional[Tuple[int, int, int, int]],
-    ) -> Optional[Tuple[int, int, int, int]]:
-        """Merge two bounding boxes if both exist."""
-        if new is None:
-            return current
-        if current is None:
-            return new
-        return (
-            min(current[0], new[0]),
-            min(current[1], new[1]),
-            max(current[2], new[2]),
-            max(current[3], new[3]),
-        )
-
-    @staticmethod
     def _format_duration(seconds: Optional[float]) -> str:
         """Convert a second count into a compact d/h/m/s string."""
         if seconds is None:
@@ -1139,281 +604,49 @@ class TimelapseBackup:
         fps: int,
         crop_bounds: Tuple[int, int, int, int]
     ) -> None:
-        """Encode frames streamed as PNG data into FFmpeg using a modern codec."""
-        if shutil.which("ffmpeg") is None:
-            raise RuntimeError(
-                "ffmpeg not found on PATH. Install ffmpeg with libx264/libx265/libsvtav1."
-            )
-
-        x0, y0, x1, y1 = crop_bounds
-        crop_w, crop_h = (x1 - x0), (y1 - y0)
-        crop_filter = f"crop={crop_w}:{crop_h}:{x0}:{y0}"
-
-        codec_args = [
-            "-c:v",
-            "libx264",
-            "-crf",
-            str(getattr(self, "quality", 20)),
-            "-preset",
-            "slow",
-            "-tune",
-            "animation",
-            "-x264-params",
-            "keyint=300:min-keyint=300:scenecut=0",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-        ]
-
-        temp_output = output_path.with_name(f".tmp_{uuid.uuid4().hex}_{output_path.name}")
-        if temp_output.exists():
-            temp_output.unlink()
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "-framerate",
-            str(fps),
-            "-i",
-            "-",
-            "-vf",
-            crop_filter,
-            "-an",
-            *codec_args,
-            str(temp_output),
-        ]
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+        renderer = self._get_renderer()
+        renderer.encode_with_ffmpeg(
+            iter(frame_iter),
+            output_path,
+            fps,
+            crop_bounds,
+            quality=getattr(self, "quality", 20),
         )
-        stderr_data: bytes = b""
-        return_code: Optional[int] = None
-        stderr_chunks: List[bytes] = []
-        stderr_thread: Optional[threading.Thread] = None
 
-        if process.stderr is not None:
-            def _drain_stderr(pipe: Any, collector: List[bytes]) -> None:
-                """Continuously read FFmpeg stderr so it cannot block."""
-                try:
-                    for chunk in iter(lambda: pipe.read(8192), b""):
-                        if chunk:
-                            collector.append(chunk)
-                finally:
-                    try:
-                        pipe.close()
-                    except OSError:
-                        pass
 
-            stderr_thread = threading.Thread(
-                target=_drain_stderr,
-                args=(process.stderr, stderr_chunks),
-                daemon=True,
-            )
-            stderr_thread.start()
 
-        try:
-            for frame_data in frame_iter:
-                if process.stdin is None:
-                    raise RuntimeError("FFmpeg stdin closed unexpectedly.")
-                process.stdin.write(frame_data)
-            if process.stdin:
-                process.stdin.close()
-            return_code = process.wait()
-        except Exception:
-            process.kill()
-            raise
-        finally:
-            if process.stdin is not None and not process.stdin.closed:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-            if stderr_thread is not None:
-                stderr_thread.join()
-            elif process.stderr is not None:
-                try:
-                    process.stderr.close()
-                except OSError:
-                    pass
-
-        if stderr_thread is not None:
-            stderr_data = b"".join(stderr_chunks)
-        elif process.stderr is not None:
-            try:
-                stderr_data = process.stderr.read()
-            except OSError:
-                stderr_data = b""
-
-        if return_code is None:
-            return_code = process.poll()
-
-        if return_code != 0:
-            stderr_text = (
-                stderr_data.decode("utf-8", errors="replace")
-                if stderr_data
-                else ''
-            )
-            if temp_output.exists():
-                try:
-                    temp_output.unlink()
-                except OSError:
-                    pass
-            raise subprocess.CalledProcessError(return_code or -1, cmd, stderr=stderr_text)
-
-        temp_output.replace(output_path)
-        
     def create_differential_frame(
         self,
         prev_frame: Optional[np.ndarray],
         curr_frame: np.ndarray,
         return_stats: bool = False,
     ) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
-        """Create differential frame showing changes between two frames."""
-        changed_pixels = 0
-        if prev_frame is None:
-            # First frame - return configured background color
-            frame = np.full_like(curr_frame, self.background_color)
-            return (frame, changed_pixels) if return_stats else frame
-            
-        # Calculate absolute difference
-        diff = cv2.absdiff(prev_frame, curr_frame)
-        background = np.full_like(curr_frame, self.background_color)
-        
-        if self.diff_visualization == 'binary':
-            # Binary difference: white changes on black background
-            gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            _, binary_diff = cv2.threshold(gray_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-            result = background.copy()
-            mask = binary_diff > 0
-            result[mask] = (255, 255, 255)
-            changed_pixels = int(np.count_nonzero(mask))
-            return (result, changed_pixels) if return_stats else result
-            
-        elif self.diff_visualization == 'heatmap':
-            # Heatmap: color-coded intensity of changes
-            gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            # Apply threshold
-            _, thresholded = cv2.threshold(gray_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-            # Apply enhancement
-            enhanced = cv2.multiply(thresholded, self.diff_enhancement_factor)
-            enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
-            # Apply colormap (COLORMAP_JET for blue->red heatmap)
-            heatmap = cv2.applyColorMap(enhanced, cv2.COLORMAP_JET)
-            result = background.copy()
-            mask = thresholded > 0
-            result[mask] = heatmap[mask]
-            changed_pixels = int(np.count_nonzero(mask))
-            return (result, changed_pixels) if return_stats else result
-            
-        elif self.diff_visualization == 'overlay':
-            # Overlay: changes highlighted on semi-transparent background
-            gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(gray_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-            
-            # Create overlay
-            overlay = curr_frame.copy()
-            overlay[mask > 0] = [0, 255, 255]  # Yellow highlight for changes
-            
-            # Blend with original frame
-            alpha = 0.7
-            result = cv2.addWeighted(curr_frame, alpha, overlay, 1-alpha, 0)
-            changed_pixels = int(np.count_nonzero(mask))
-            return (result, changed_pixels) if return_stats else result
-            
-        elif self.diff_visualization == 'colored':
-            # Colored difference: green for additions, red for removals
-            # This is a simplified version - in practice, detecting additions vs removals 
-            # requires more sophisticated analysis
-            gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(gray_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-            
-            # Create colored diff image
-            colored_diff = np.zeros_like(curr_frame)
-            
-            # Show changes in bright green
-            colored_diff[mask > 0] = [0, 255, 0]  # Green for changes
-            
-            # Enhance visibility
-            enhanced_diff = cv2.multiply(colored_diff, self.diff_enhancement_factor)
-            enhanced_diff = np.clip(enhanced_diff, 0, 255).astype(np.uint8)
-            
-            result = background.copy()
-            change_mask = mask > 0
-            result[change_mask] = enhanced_diff[change_mask]
-            changed_pixels = int(np.count_nonzero(change_mask))
-            return (result, changed_pixels) if return_stats else result
-            
-        else:
-            # Default to absolute difference
-            result = background.copy()
-            diff_mask = np.any(diff > 0, axis=2)
-            result[diff_mask] = diff[diff_mask]
-            changed_pixels = int(np.count_nonzero(diff_mask))
-            return (result, changed_pixels) if return_stats else result
-    
-    def get_enabled_timelapse_modes(self, timelapse_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Get list of enabled timelapse modes for a timelapse"""
-        modes = timelapse_config.get('timelapse_modes', {
-            'normal': {'enabled': True, 'suffix': ''}
-        })
-        
-        enabled_modes: List[Dict[str, Any]] = []
-        for mode_name, mode_config in modes.items():
-            if mode_config.get('enabled', True):
-                suffix = mode_config.get('suffix', f'_{mode_name}' if mode_name != 'normal' else '')
-                enabled_modes.append({
-                    'mode': mode_name,
-                    'suffix': suffix,
-                    'create_full': mode_config.get('create_full_timelapse', False)
-                })
-                
-        return enabled_modes
+        """Delegate differential frame generation to the renderer."""
+        return self._get_renderer().create_differential_frame(
+            prev_frame,
+            curr_frame,
+            return_stats=return_stats,
+        )
 
-    def get_session_dirs_for_date(self, slug: str, date_str: str) -> List[Path]:
-        """Return session directories for a specific date ordered chronologically"""
-        date_dir = self.backup_dir / slug / date_str
-        if not date_dir.exists():
-            return []
-
-        sessions: List[Tuple[datetime, Path]] = []
-        for session_dir in date_dir.iterdir():
-            if not session_dir.is_dir():
-                continue
-            session_dt = self._parse_session_datetime(session_dir)
-            if session_dt is None:
-                continue
-            sessions.append((session_dt, session_dir))
-
-        sessions.sort(key=lambda item: item[0])
-        return [path for _, path in sessions]
-
-    def get_all_sessions(self, slug: str) -> List[Path]:
-        """Collect all available session directories for a timelapse ordered chronologically"""
-        slug_dir = self.backup_dir / slug
-        if not slug_dir.exists():
-            return []
-
-        sessions: List[Tuple[datetime, Path]] = []
-        for date_dir in slug_dir.iterdir():
-            if not date_dir.is_dir():
-                continue
-            for session_dir in date_dir.iterdir():
-                if not session_dir.is_dir():
-                    continue
-                session_dt = self._parse_session_datetime(session_dir)
-                if session_dt is None:
-                    continue
-                sessions.append((session_dt, session_dir))
-
-        sessions.sort(key=lambda item: item[0])
-        return [path for _, path in sessions]
+    def _prepare_frames_from_manifests(
+        self,
+        manifests: List[FrameManifest],
+        coordinates: List[Tuple[int, int]],
+        temp_dir: Path,
+        slug: str,
+        name: str,
+        mode_name: str,
+        label: str,
+    ) -> List[PreparedFrame]:
+        return self._get_renderer().prepare_frames_from_manifests(
+            manifests,
+            coordinates,
+            temp_dir,
+            slug,
+            name,
+            mode_name,
+            label,
+        )
 
     def _build_frame_manifests(
         self,
@@ -1425,138 +658,17 @@ class TimelapseBackup:
         mode_name: str,
         label: str,
     ) -> List[FrameManifest]:
-        """Generate frame manifests while respecting placeholder fallbacks."""
-        manifests: List[FrameManifest] = []
-        manifest_tile_cache: Dict[Tuple[int, int], Path] = {}
-        prep_total = len(session_dirs)
-        if prep_total == 0:
-            return manifests
-
-        prep_interval = max(1, prep_total // 20)
-        valid_frames = 0
-
-        for index, session_dir in enumerate(session_dirs, start=1):
-            manifest = self._build_manifest_for_session(
-                session_dir,
-                timelapse_config,
-                coordinates,
-                manifest_tile_cache,
-            )
-            if manifest is not None:
-                manifests.append(manifest)
-                valid_frames += 1
-
-            if index % prep_interval == 0 or index == prep_total:
-                percent = (index / prep_total) * 100.0
-                self.logger.info(
-                    f"Frame preparation progress for '{name}' ({slug}) {mode_name} {label}: "
-                    f"{index}/{prep_total} sessions scanned, {valid_frames} usable ({percent:.1f}%)"
-                )
-
-        return manifests
-
-    def _render_frame_from_manifest(
-        self,
-        index: int,
-        manifest: FrameManifest,
-        coordinates: List[Tuple[int, int]],
-        x_coords: List[int],
-        y_coords: List[int],
-        x_index_map: Dict[int, int],
-        y_index_map: Dict[int, int],
-        temp_dir: Path,
-    ) -> PreparedFrame:
-        """Worker routine to render a composite and persist it to disk."""
-        composite = self._compose_frame_from_manifest(
-            manifest,
+        builder = self._get_manifest_builder()
+        backup_root = getattr(self, "backup_dir", None)
+        return builder.build_frame_manifests(
+            session_dirs,
             coordinates,
-            x_coords,
-            y_coords,
-            x_index_map,
-            y_index_map,
+            backup_root=backup_root,
+            slug=slug,
+            mode_name=mode_name,
+            label=label,
+            timelapse_name=name,
         )
-        if composite is None:
-            return PreparedFrame(
-                index=index,
-                session_dir=manifest.session_dir,
-                temp_path=None,
-                frame_shape=None,
-                alpha_bounds=None,
-            )
-
-        frame_bounds = None
-        if self.auto_crop_transparent_frames:
-            frame_bounds = self._update_content_bounds(composite.alpha, None)
-
-        success, buffer = cv2.imencode(".png", composite.color)
-        if not success:
-            raise RuntimeError(
-                f"Failed to encode frame for manifest index {index} ({manifest.session_dir})"
-            )
-
-        temp_path = temp_dir / f"frame_{index:06d}.png"
-        temp_path.write_bytes(buffer.tobytes())
-
-        return PreparedFrame(
-            index=index,
-            session_dir=manifest.session_dir,
-            temp_path=temp_path,
-            frame_shape=composite.color.shape[:2],
-            alpha_bounds=frame_bounds,
-        )
-
-    def _prepare_frames_from_manifests(
-        self,
-        manifests: List[FrameManifest],
-        coordinates: List[Tuple[int, int]],
-        x_coords: List[int],
-        y_coords: List[int],
-        x_index_map: Dict[int, int],
-        y_index_map: Dict[int, int],
-        temp_dir: Path,
-        slug: str,
-        name: str,
-        mode_name: str,
-        label: str,
-    ) -> List[PreparedFrame]:
-        """Render frames in parallel using previously built manifests."""
-        if not manifests:
-            return []
-
-        max_workers = max(1, getattr(self, "frame_prep_workers", 1))
-        total = len(manifests)
-        progress_interval = max(1, total // 20)
-        prepared: List[Optional[PreparedFrame]] = [None] * total
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self._render_frame_from_manifest,
-                    index,
-                    manifest,
-                    coordinates,
-                    x_coords,
-                    y_coords,
-                    x_index_map,
-                    y_index_map,
-                    temp_dir,
-                )
-                for index, manifest in enumerate(manifests)
-            ]
-
-            completed = 0
-            for future in as_completed(futures):
-                result = future.result()
-                prepared[result.index] = result
-                completed += 1
-                if completed % progress_interval == 0 or completed == total:
-                    percent = (completed / total) * 100.0
-                    self.logger.info(
-                        f"Frame rendering progress for '{name}' ({slug}) {mode_name} {label}: "
-                        f"{completed}/{total} frames ({percent:.1f}%)"
-                    )
-
-        return [frame for frame in prepared if frame and frame.temp_path is not None]
 
     def _frame_byte_generator(
         self,
@@ -1567,80 +679,15 @@ class TimelapseBackup:
         label: str,
         frame_datetimes: List[Optional[datetime]],
     ) -> Tuple[Iterator[bytes], TimelapseStatsCollector]:
-        """Yield encoded PNG data for prepared frames in order while collecting stats."""
-        total_frames = len(prepared_frames)
-        if total_frames == 0:
-            return iter(()), TimelapseStatsCollector(frame_datetimes)
-
-        progress_interval = max(1, total_frames // 20)
-        stats_collector = TimelapseStatsCollector(frame_datetimes)
-        historical_cutoff = getattr(self, "historical_cutoff", None)
-
-        def generator() -> Iterator[bytes]:
-            prev_composite_color: Optional[np.ndarray] = None
-            prev_frame_timestamp: Optional[datetime] = None
-
-            for zero_based_index, prepared in enumerate(prepared_frames):
-                if prepared.temp_path is None:
-                    stats_collector.record(zero_based_index, None)
-                    continue
-
-                frame_timestamp = (
-                    frame_datetimes[zero_based_index]
-                    if zero_based_index < len(frame_datetimes)
-                    else None
-                )
-                is_historical = (
-                    historical_cutoff is not None
-                    and frame_timestamp is not None
-                    and frame_timestamp < historical_cutoff
-                )
-                prev_is_historical = (
-                    historical_cutoff is not None
-                    and prev_frame_timestamp is not None
-                    and prev_frame_timestamp < historical_cutoff
-                )
-                exclude_change_stats = is_historical or prev_is_historical
-
-                if mode_name == "diff":
-                    composite_color = cv2.imread(str(prepared.temp_path), cv2.IMREAD_COLOR)
-                    if composite_color is None:
-                        raise RuntimeError(
-                            f"Failed to read prepared composite for diff mode: {prepared.temp_path}"
-                        )
-                    frame, changed_pixels = self.create_differential_frame(
-                        prev_composite_color,
-                        composite_color,
-                        return_stats=True,
-                    )
-                    prev_composite_color = composite_color
-                    success, buffer = cv2.imencode(".png", frame)
-                    if not success:
-                        raise RuntimeError(
-                            f"Failed to encode differential frame for '{name}' ({slug}) {mode_name} {label}"
-                        )
-                    frame_bytes = buffer.tobytes()
-                else:
-                    frame_bytes = prepared.temp_path.read_bytes()
-                    changed_pixels = None
-
-                stats_collector.record(
-                    zero_based_index,
-                    None if exclude_change_stats else changed_pixels,
-                )
-                if frame_timestamp is not None:
-                    prev_frame_timestamp = frame_timestamp
-                yield frame_bytes
-
-                frame_number = zero_based_index + 1
-                if frame_number % progress_interval == 0 or frame_number == total_frames:
-                    percent = (frame_number / total_frames) * 100.0
-                    self.logger.info(
-                        f"Encoding progress for '{name}' ({slug}) {mode_name} {label}: "
-                        f"{frame_number}/{total_frames} frames ({percent:.1f}%)"
-                    )
-
-        return generator(), stats_collector
+        renderer = self._get_renderer()
+        return renderer.frame_byte_generator(
+            prepared_frames,
+            mode_name,
+            slug,
+            name,
+            label,
+            frame_datetimes,
+        )
 
     def render_timelapse_from_sessions(
         self,
@@ -1656,25 +703,32 @@ class TimelapseBackup:
         """Create timelapse from a pre-collected list of session directories"""
         if not session_dirs:
             self.logger.warning(
-                f"No session directories found for '{name}' ({slug}) {label}"
+                "No session directories found for '%s' (%s) %s",
+                name,
+                slug,
+                label,
             )
             return
 
         self.logger.info(
-            f"Creating {mode_name} timelapse for '{name}' ({slug}) {label} with {len(session_dirs)} frames"
+            "Creating %s timelapse for '%s' (%s) %s with %s frames",
+            mode_name,
+            name,
+            slug,
+            label,
+            len(session_dirs),
         )
 
         coordinates = self.get_tile_coordinates(timelapse_config)
         if not coordinates:
             self.logger.error(
-                f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+                "No valid frames created for '%s' (%s) %s %s",
+                name,
+                slug,
+                mode_name,
+                label,
             )
             return
-
-        x_coords = sorted(set(x for x, y in coordinates))
-        y_coords = sorted(set(y for x, y in coordinates))
-        x_index_map = {value: idx for idx, value in enumerate(x_coords)}
-        y_index_map = {value: idx for idx, value in enumerate(y_coords)}
 
         manifests = self._build_frame_manifests(
             session_dirs,
@@ -1687,15 +741,19 @@ class TimelapseBackup:
         )
         if not manifests:
             self.logger.error(
-                f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+                "No valid frames created for '%s' (%s) %s %s",
+                name,
+                slug,
+                mode_name,
+                label,
             )
             return
 
         output_dir = self.output_dir / slug
         output_dir.mkdir(exist_ok=True)
-
         output_path = output_dir / output_filename
 
+        renderer = self._get_renderer()
         total_frames = 0
 
         with tempfile.TemporaryDirectory() as temp_dir_str:
@@ -1703,10 +761,6 @@ class TimelapseBackup:
             prepared_frames = self._prepare_frames_from_manifests(
                 manifests,
                 coordinates,
-                x_coords,
-                y_coords,
-                x_index_map,
-                y_index_map,
                 temp_dir,
                 slug,
                 name,
@@ -1716,83 +770,28 @@ class TimelapseBackup:
 
             if not prepared_frames:
                 self.logger.error(
-                    f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+                    "No valid frames created for '%s' (%s) %s %s",
+                    name,
+                    slug,
+                    mode_name,
+                    label,
                 )
                 return
 
-            first_frame_shape: Optional[Tuple[int, int]] = None
-            content_bounds: Optional[Tuple[int, int, int, int]] = None
-
-            for frame in prepared_frames:
-                if frame.frame_shape is None:
-                    continue
-                if first_frame_shape is None:
-                    first_frame_shape = frame.frame_shape
-                if self.auto_crop_transparent_frames and frame.alpha_bounds is not None:
-                    content_bounds = self._merge_bounds(content_bounds, frame.alpha_bounds)
-
-            if first_frame_shape is None:
-                self.logger.error(
-                    f"No valid frames created for '{name}' ({slug}) {mode_name} {label}"
+            try:
+                crop_bounds, _ = renderer.compute_crop_bounds(
+                    prepared_frames,
+                    slug=slug,
+                    name=name,
+                    mode_name=mode_name,
+                    label=label,
                 )
+            except RuntimeError as exc:
+                self.logger.error(str(exc))
                 return
-
-            frame_height, frame_width = first_frame_shape
-
-            if self.auto_crop_transparent_frames and content_bounds is not None:
-                min_x, min_y, max_x, max_y = content_bounds
-                min_x = max(0, min(min_x, frame_width - 1))
-                min_y = max(0, min(min_y, frame_height - 1))
-                max_x = max(min_x + 1, min(max_x, frame_width))
-                max_y = max(min_y + 1, min(max_y, frame_height))
-                crop_bounds = (min_x, min_y, max_x, max_y)
-            else:
-                crop_bounds = (0, 0, frame_width, frame_height)
-
-            crop_width = crop_bounds[2] - crop_bounds[0]
-            crop_height = crop_bounds[3] - crop_bounds[1]
-            if crop_width <= 0 or crop_height <= 0:
-                crop_bounds = (0, 0, frame_width, frame_height)
-                crop_width = frame_width
-                crop_height = frame_height
-
-            x0, y0, x1, y1 = crop_bounds
-
-            if crop_width % 2 != 0:
-                if x1 < frame_width:
-                    x1 = min(frame_width, x1 + 1)
-                elif x0 > 0:
-                    x0 = max(0, x0 - 1)
-                else:
-                    self.logger.warning(
-                        f"Unable to expand width to even dimension for '{name}' ({slug}) {mode_name} {label}"
-                    )
-
-            if crop_height % 2 != 0:
-                if y1 < frame_height:
-                    y1 = min(frame_height, y1 + 1)
-                elif y0 > 0:
-                    y0 = max(0, y0 - 1)
-                else:
-                    self.logger.warning(
-                        f"Unable to expand height to even dimension for '{name}' ({slug}) {mode_name} {label}"
-                    )
-
-            crop_bounds = (x0, y0, x1, y1)
-            crop_width = x1 - x0
-            crop_height = y1 - y0
-
-            if (
-                self.auto_crop_transparent_frames
-                and (crop_width != frame_width or crop_height != frame_height)
-            ):
-                self.logger.info(
-                    f"Cropping '{name}' ({slug}) {mode_name} {label} to {crop_width}x{crop_height} "
-                    f"from original {frame_width}x{frame_height}"
-                )
 
             frame_datetimes: List[Optional[datetime]] = [
-                self._parse_session_datetime(frame.session_dir)
+                parse_session_datetime(frame.session_dir)
                 for frame in prepared_frames
             ]
 
@@ -1809,7 +808,12 @@ class TimelapseBackup:
 
             total_frames = len(prepared_frames)
             self.logger.info(
-                f"Streaming {total_frames} frames to FFmpeg for '{name}' ({slug}) {mode_name} {label}"
+                "Streaming %s frames to FFmpeg for '%s' (%s) %s %s",
+                total_frames,
+                name,
+                slug,
+                mode_name,
+                label,
             )
 
             try:
@@ -1824,7 +828,12 @@ class TimelapseBackup:
                 self._encode_with_ffmpeg(frame_iter, output_path, self.fps, crop_bounds)
             except subprocess.CalledProcessError as exc:
                 self.logger.error(
-                    f"FFmpeg encoding failed for '{name}' ({slug}) {mode_name} {label}: {exc.stderr or exc}"
+                    "FFmpeg encoding failed for '%s' (%s) %s %s: %s",
+                    name,
+                    slug,
+                    mode_name,
+                    label,
+                    exc.stderr or exc,
                 )
                 raise
             else:
@@ -1851,13 +860,23 @@ class TimelapseBackup:
                         )
                     except OSError as exc:
                         self.logger.error(
-                            f"Failed to write stats file for '{name}' ({slug}) {mode_name} {label}: {exc}"
+                            "Failed to write stats file for '%s' (%s) %s %s: %s",
+                            name,
+                            slug,
+                            mode_name,
+                            label,
+                            exc,
                         )
 
         self.logger.info(
-            f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({total_frames} frames)"
+            "%s timelapse created for '%s' (%s): %s (%s frames)",
+            mode_name.title(),
+            name,
+            slug,
+            output_path,
+            total_frames,
         )
-        
+
     def create_daily_timelapse(self, date: datetime = None):
         """Create timelapse videos from previous day's images for all timelapses"""
         if date is None:
@@ -1873,7 +892,7 @@ class TimelapseBackup:
             name = timelapse['name']
             
             enabled_modes = self.get_enabled_timelapse_modes(timelapse)
-            session_dirs = self.get_session_dirs_for_date(slug, date_str)
+            session_dirs = get_session_dirs_for_date(self.backup_dir, slug, date_str)
 
             for mode in enabled_modes:
                 mode_name = mode['mode']
@@ -1893,7 +912,7 @@ class TimelapseBackup:
                 )
 
                 if mode.get('create_full'):
-                    full_session_dirs = self.get_all_sessions(slug)
+                    full_session_dirs = get_all_sessions(self.backup_dir, slug)
                     self.render_timelapse_from_sessions(
                         slug,
                         name,
@@ -1921,7 +940,7 @@ class TimelapseBackup:
             if not enabled_modes:
                 continue
 
-            session_dirs = self.get_all_sessions(slug)
+            session_dirs = get_all_sessions(self.backup_dir, slug)
             for mode in enabled_modes:
                 self.render_timelapse_from_sessions(
                     slug,
@@ -1936,7 +955,7 @@ class TimelapseBackup:
             
     def create_timelapse_for_slug(self, slug: str, name: str, timelapse_config: Dict[str, Any], date_str: str, mode_name: str = 'normal', suffix: str = ''):
         """Create timelapse video for a specific timelapse slug and mode"""
-        session_dirs = self.get_session_dirs_for_date(slug, date_str)
+        session_dirs = get_session_dirs_for_date(self.backup_dir, slug, date_str)
         self.render_timelapse_from_sessions(
             slug,
             name,
