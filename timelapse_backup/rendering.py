@@ -253,23 +253,24 @@ class Renderer:
 
         def generator() -> Iterator[bytes]:
             prev_composite_color: Optional[np.ndarray] = None
-            prev_frame_timestamp: Optional[datetime] = None
 
             for zero_based_index, prepared in enumerate(prepared_frames):
-                if prepared.temp_path is None:
-                    stats_collector.record(zero_based_index, None)
-                    continue
-
                 frame_timestamp = (
                     frame_datetimes[zero_based_index]
                     if zero_based_index < len(frame_datetimes)
                     else None
                 )
-                exclude_change_stats = self._should_exclude_stats(
-                    frame_timestamp,
-                    prev_frame_timestamp,
-                )
+                is_historical = self._is_historical_timestamp(frame_timestamp)
 
+                if prepared.temp_path is None:
+                    stats_collector.record(
+                        zero_based_index,
+                        None,
+                        exclude_from_timing=is_historical,
+                    )
+                    continue
+
+                changed_pixels: Optional[int]
                 if mode_name == "diff":
                     composite_color = cv2.imread(str(prepared.temp_path), cv2.IMREAD_COLOR)
                     if composite_color is None:
@@ -291,13 +292,11 @@ class Renderer:
                 else:
                     frame_bytes = prepared.temp_path.read_bytes()
                     changed_pixels = None
-
                 stats_collector.record(
                     zero_based_index,
-                    None if exclude_change_stats else changed_pixels,
+                    changed_pixels,
+                    exclude_from_timing=is_historical,
                 )
-                if frame_timestamp is not None:
-                    prev_frame_timestamp = frame_timestamp
                 yield frame_bytes
 
                 frame_number = zero_based_index + 1
@@ -506,19 +505,15 @@ class Renderer:
     # Helper utilities
     # ------------------------------------------------------------------
 
-    def _should_exclude_stats(
+    def _is_historical_timestamp(
         self,
         frame_timestamp: Optional[datetime],
-        previous_timestamp: Optional[datetime],
     ) -> bool:
-        if self.historical_cutoff is None:
-            return False
-        is_historical = frame_timestamp is not None and frame_timestamp < self.historical_cutoff
-        prev_is_historical = (
-            previous_timestamp is not None
-            and previous_timestamp < self.historical_cutoff
+        return (
+            self.historical_cutoff is not None
+            and frame_timestamp is not None
+            and frame_timestamp < self.historical_cutoff
         )
-        return is_historical or prev_is_historical
 
     @staticmethod
     def _update_content_bounds(

@@ -15,7 +15,13 @@ class TimelapseStatsCollector:
     frame_datetimes: List[Optional[datetime]]
     records: List[Dict[str, Any]] = field(default_factory=list)
 
-    def record(self, frame_index: int, changed_pixels: Optional[int]) -> None:
+    def record(
+        self,
+        frame_index: int,
+        changed_pixels: Optional[int],
+        *,
+        exclude_from_timing: bool = False,
+    ) -> None:
         """Record stats for a single frame."""
         timestamp = None
         if 0 <= frame_index < len(self.frame_datetimes):
@@ -23,6 +29,7 @@ class TimelapseStatsCollector:
         entry = {
             "timestamp": timestamp,
             "changed_pixels": None if changed_pixels is None else int(changed_pixels),
+            "exclude_from_timing": exclude_from_timing,
         }
         self.records.append(entry)
 
@@ -37,6 +44,12 @@ class TimelapseStatsCollector:
         total_changed_pixels = sum(
             entry["changed_pixels"] or 0 for entry in self.records
         )
+        timing_records = [
+            entry for entry in self.records if not entry.get("exclude_from_timing", False)
+        ]
+        if not timing_records:
+            timing_records = list(self.records)
+
         frames_with_change = 0
         frames_without_change = 0
         frames_with_known_change = 0
@@ -54,7 +67,7 @@ class TimelapseStatsCollector:
         max_change_pixels = 0
         max_change_timestamp: Optional[datetime] = None
 
-        for entry in self.records:
+        for entry in timing_records:
             changed = entry["changed_pixels"]
             if changed is None:
                 continue
@@ -62,7 +75,11 @@ class TimelapseStatsCollector:
                 max_change_pixels = changed
                 max_change_timestamp = entry["timestamp"]
 
-        timestamps = [entry["timestamp"] for entry in self.records if entry["timestamp"] is not None]
+        timestamps = [
+            entry["timestamp"]
+            for entry in timing_records
+            if entry["timestamp"] is not None
+        ]
         start_timestamp = timestamps[0] if timestamps else None
         end_timestamp = timestamps[-1] if timestamps else None
         total_duration_seconds = (
@@ -73,7 +90,7 @@ class TimelapseStatsCollector:
 
         intervals: List[float] = []
         previous_ts: Optional[datetime] = None
-        for entry in self.records:
+        for entry in timing_records:
             ts = entry["timestamp"]
             if ts is None:
                 continue
@@ -97,7 +114,7 @@ class TimelapseStatsCollector:
         current_run_start: Optional[datetime] = None
         previous_in_run_timestamp: Optional[datetime] = None
 
-        for entry in self.records:
+        for entry in timing_records:
             ts = entry["timestamp"]
             changed = entry["changed_pixels"]
             if changed == 0:
@@ -131,7 +148,7 @@ class TimelapseStatsCollector:
         coverage_gaps: List[Dict[str, Any]] = []
         if gap_threshold is not None and gap_threshold.total_seconds() > 0:
             previous_ts = None
-            for entry in self.records:
+            for entry in timing_records:
                 ts = entry["timestamp"]
                 if ts is None:
                     continue
@@ -169,8 +186,14 @@ class TimelapseStatsCollector:
         average_pixels_per_frame = (
             total_changed_pixels / rendered_frames if rendered_frames else 0.0
         )
+        timing_changed_pixels_total = sum(
+            entry["changed_pixels"] or 0 for entry in timing_records
+        )
+        timing_rendered_frames = len(timing_records)
         average_time_per_frame_seconds = (
-            total_time_invested_seconds / rendered_frames if rendered_frames else 0.0
+            (timing_changed_pixels_total * seconds_per_pixel) / timing_rendered_frames
+            if timing_rendered_frames
+            else 0.0
         )
 
         return {

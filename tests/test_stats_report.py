@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from timelapse_backup import TimelapseBackup
+from timelapse_backup.stats import TimelapseStatsCollector
 
 
 def _create_session(session_root: Path, timestamp: datetime, image: np.ndarray) -> Path:
@@ -105,3 +106,27 @@ def test_stats_report_counts_expected_pixels(tmp_path):
     assert "Total changed pixels: 100" in report
     assert "Frames with change: 10" in report
     assert "Frames excluded from change stats" not in report
+
+
+def test_stats_summary_ignores_historical_for_timing_metrics():
+    frame_times = [
+        datetime(2025, 10, 12, 21, 0, 0),
+        datetime(2025, 10, 13, 0, 5, 0),
+        datetime(2025, 10, 13, 0, 7, 0),
+        datetime(2025, 10, 13, 0, 9, 0),
+    ]
+    collector = TimelapseStatsCollector(list(frame_times))
+    collector.record(0, 500, exclude_from_timing=True)
+    collector.record(1, 120)
+    collector.record(2, 0)
+    collector.record(3, 0)
+
+    summary = collector.summarize(gap_threshold=None, seconds_per_pixel=1)
+
+    assert summary["total_changed_pixels"] == 620
+    assert summary["average_time_per_frame_seconds"] == 40.0
+    assert summary["max_change_pixels"] == 120
+    assert summary["max_change_frame_timestamp"] == frame_times[1].isoformat()
+    assert summary["longest_idle_run_frames"] == 2
+    assert summary["longest_idle_run_duration_seconds"] == 120.0
+    assert summary["longest_idle_run_start_timestamp"] == frame_times[2].isoformat()
