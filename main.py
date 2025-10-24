@@ -16,10 +16,10 @@ import shutil
 import uuid
 import threading
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional, Iterable
+from typing import List, Tuple, Dict, Any, Optional, Iterable, Iterator, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -53,11 +53,209 @@ class PreparedFrame:
     frame_shape: Optional[Tuple[int, int]]
     alpha_bounds: Optional[Tuple[int, int, int, int]]
 
+
+@dataclass
+class TimelapseStatsCollector:
+    """Aggregate per-frame change statistics and timing metadata."""
+    frame_datetimes: List[Optional[datetime]]
+    records: List[Dict[str, Any]] = field(default_factory=list)
+
+    def record(self, frame_index: int, changed_pixels: Optional[int]) -> None:
+        """Record stats for a single frame."""
+        timestamp = None
+        if 0 <= frame_index < len(self.frame_datetimes):
+            timestamp = self.frame_datetimes[frame_index]
+        entry = {
+            "timestamp": timestamp,
+            "changed_pixels": None if changed_pixels is None else int(changed_pixels),
+        }
+        self.records.append(entry)
+
+    def summarize(
+        self,
+        gap_threshold: Optional[timedelta],
+        seconds_per_pixel: int = 30,
+    ) -> Dict[str, Any]:
+        """Produce a dictionary summary of collected statistics."""
+        rendered_frames = len(self.records)
+        total_changed_pixels = sum(
+            entry["changed_pixels"] or 0 for entry in self.records
+        )
+        frames_with_change = 0
+        frames_without_change = 0
+        frames_with_known_change = 0
+
+        for entry in self.records:
+            changed = entry["changed_pixels"]
+            if changed is None:
+                continue
+            frames_with_known_change += 1
+            if changed > 0:
+                frames_with_change += 1
+            else:
+                frames_without_change += 1
+        frames_excluded_from_stats = rendered_frames - frames_with_known_change
+        max_change_pixels = 0
+        max_change_timestamp: Optional[datetime] = None
+
+        for entry in self.records:
+            changed = entry["changed_pixels"]
+            if changed is None:
+                continue
+            if changed > max_change_pixels:
+                max_change_pixels = changed
+                max_change_timestamp = entry["timestamp"]
+
+        timestamps = [entry["timestamp"] for entry in self.records if entry["timestamp"] is not None]
+        start_timestamp = timestamps[0] if timestamps else None
+        end_timestamp = timestamps[-1] if timestamps else None
+        total_duration_seconds = (
+            (end_timestamp - start_timestamp).total_seconds()
+            if start_timestamp and end_timestamp and end_timestamp >= start_timestamp
+            else 0.0
+        )
+
+        intervals: List[float] = []
+        previous_ts: Optional[datetime] = None
+        for entry in self.records:
+            ts = entry["timestamp"]
+            if ts is None:
+                continue
+            if previous_ts is not None:
+                intervals.append(max(0.0, (ts - previous_ts).total_seconds()))
+            previous_ts = ts
+
+        if intervals:
+            average_interval = sum(intervals) / len(intervals)
+            min_interval = min(intervals)
+            max_interval = max(intervals)
+        else:
+            average_interval = min_interval = max_interval = 0.0
+
+        longest_idle_run_frames = 0
+        longest_idle_run_duration = 0.0
+        longest_idle_run_start: Optional[datetime] = None
+
+        current_run_frames = 0
+        current_run_duration = 0.0
+        current_run_start: Optional[datetime] = None
+        previous_in_run_timestamp: Optional[datetime] = None
+
+        for entry in self.records:
+            ts = entry["timestamp"]
+            changed = entry["changed_pixels"]
+            if changed == 0:
+                if current_run_frames == 0:
+                    current_run_start = ts
+                    current_run_duration = 0.0
+                else:
+                    if ts is not None and previous_in_run_timestamp is not None:
+                        current_run_duration += max(
+                            0.0, (ts - previous_in_run_timestamp).total_seconds()
+                        )
+                current_run_frames += 1
+
+                if current_run_frames > longest_idle_run_frames or (
+                    current_run_frames == longest_idle_run_frames
+                    and current_run_duration > longest_idle_run_duration
+                ):
+                    longest_idle_run_frames = current_run_frames
+                    longest_idle_run_duration = current_run_duration
+                    longest_idle_run_start = current_run_start
+            else:
+                current_run_frames = 0
+                current_run_duration = 0.0
+                current_run_start = None
+
+            if changed is not None:
+                previous_in_run_timestamp = ts
+            elif ts is not None:
+                previous_in_run_timestamp = ts
+
+        coverage_gaps: List[Dict[str, Any]] = []
+        if gap_threshold is not None and gap_threshold.total_seconds() > 0:
+            previous_ts = None
+            for entry in self.records:
+                ts = entry["timestamp"]
+                if ts is None:
+                    continue
+                if previous_ts is not None:
+                    delta = ts - previous_ts
+                    if delta > gap_threshold:
+                        coverage_gaps.append({
+                            "start": previous_ts,
+                            "end": ts,
+                            "duration_seconds": delta.total_seconds(),
+                        })
+                previous_ts = ts
+
+        coverage_gap_summary: Optional[Dict[str, Any]] = None
+        if coverage_gaps:
+            sorted_gaps = sorted(
+                coverage_gaps,
+                key=lambda gap: gap["duration_seconds"],
+                reverse=True,
+            )
+            coverage_gap_summary = {
+                "count": len(coverage_gaps),
+                "max_duration_seconds": sorted_gaps[0]["duration_seconds"],
+                "examples": [
+                    {
+                        "start": gap["start"].isoformat() if gap["start"] else None,
+                        "end": gap["end"].isoformat() if gap["end"] else None,
+                        "duration_seconds": gap["duration_seconds"],
+                    }
+                    for gap in sorted_gaps[:3]
+                ],
+            }
+
+        total_time_invested_seconds = total_changed_pixels * seconds_per_pixel
+        average_pixels_per_frame = (
+            total_changed_pixels / rendered_frames if rendered_frames else 0.0
+        )
+        average_time_per_frame_seconds = (
+            total_time_invested_seconds / rendered_frames if rendered_frames else 0.0
+        )
+
+        return {
+            "rendered_frames": rendered_frames,
+            "frames_with_change": frames_with_change,
+            "frames_without_change": frames_without_change,
+            "frames_excluded_from_stats": frames_excluded_from_stats,
+            "total_changed_pixels": total_changed_pixels,
+            "average_pixels_per_frame": average_pixels_per_frame,
+            "total_time_invested_seconds": total_time_invested_seconds,
+            "average_time_per_frame_seconds": average_time_per_frame_seconds,
+            "max_change_pixels": max_change_pixels,
+            "max_change_frame_timestamp": (
+                max_change_timestamp.isoformat() if max_change_timestamp else None
+            ),
+            "start_timestamp": start_timestamp.isoformat() if start_timestamp else None,
+            "end_timestamp": end_timestamp.isoformat() if end_timestamp else None,
+            "total_duration_seconds": total_duration_seconds,
+            "capture_interval_seconds": {
+                "average": average_interval,
+                "minimum": min_interval,
+                "maximum": max_interval,
+            },
+            "longest_idle_run_frames": longest_idle_run_frames,
+            "longest_idle_run_duration_seconds": longest_idle_run_duration,
+            "longest_idle_run_start_timestamp": (
+                longest_idle_run_start.isoformat() if longest_idle_run_start else None
+            ),
+            "coverage_gaps": coverage_gap_summary,
+        }
+
 class TimelapseBackup:
     PLACEHOLDER_SUFFIX = '.placeholder'
 
     def __init__(self, config_file: str = 'config.json'):
         self.config_file = config_file
+        self.reporting_enabled: bool = True
+        self.coverage_gap_multiplier: Optional[float] = None
+        self.seconds_per_pixel: int = 30
+        # Historical data imported prior to this cutoff is treated as baseline-only.
+        self.historical_cutoff: Optional[datetime] = datetime(2025, 10, 13)
         self.config = self.load_configuration()
         
         # Setup logging
@@ -101,6 +299,7 @@ class TimelapseBackup:
             self.diff_visualization = diff_settings.get('visualization', 'colored')
             self.diff_fade_frames = diff_settings.get('fade_frames', 3)
             self.diff_enhancement_factor = diff_settings.get('enhancement_factor', 2.0)
+            self._apply_reporting_settings(settings)
             
             return config
         else:
@@ -128,6 +327,10 @@ class TimelapseBackup:
             self.diff_visualization = 'colored'
             self.diff_fade_frames = 3
             self.diff_enhancement_factor = 2.0
+            legacy_settings = {
+                'reporting': {}
+            }
+            self._apply_reporting_settings(legacy_settings)
             
             # Create legacy single timelapse config
             return {
@@ -154,6 +357,37 @@ class TimelapseBackup:
                     'auto_crop_transparent_frames': self.auto_crop_transparent_frames
                 }
             }
+
+    def _apply_reporting_settings(self, settings: Dict[str, Any]) -> None:
+        """Configure reporting-related settings with sensible defaults."""
+        reporting = settings.get('reporting', {}) if isinstance(settings, dict) else {}
+
+        enable_stats = reporting.get('enable_stats_file')
+        if enable_stats is None:
+            self.reporting_enabled = True
+        else:
+            self.reporting_enabled = self._parse_bool(enable_stats, True)
+
+        seconds_per_pixel = reporting.get('seconds_per_pixel')
+        if seconds_per_pixel is not None:
+            try:
+                parsed_seconds = int(seconds_per_pixel)
+                if parsed_seconds > 0:
+                    self.seconds_per_pixel = parsed_seconds
+            except (TypeError, ValueError):
+                pass
+
+        gap_multiplier = reporting.get('coverage_gap_multiplier')
+        if gap_multiplier is None:
+            self.coverage_gap_multiplier = None
+        else:
+            try:
+                parsed_multiplier = float(gap_multiplier)
+            except (TypeError, ValueError):
+                parsed_multiplier = None
+            self.coverage_gap_multiplier = (
+                parsed_multiplier if parsed_multiplier and parsed_multiplier > 0 else None
+            )
 
     def _parse_background_color(self, value: Any) -> Tuple[int, int, int]:
         """Parse and clamp background color definition"""
@@ -760,6 +994,144 @@ class TimelapseBackup:
             max(current[3], new[3]),
         )
 
+    @staticmethod
+    def _format_duration(seconds: Optional[float]) -> str:
+        """Convert a second count into a compact d/h/m/s string."""
+        if seconds is None:
+            return "unknown"
+        total_seconds = int(round(max(0.0, seconds)))
+        if total_seconds <= 0:
+            return "0s"
+
+        parts: List[str] = []
+        days, remainder = divmod(total_seconds, 86400)
+        if days:
+            parts.append(f"{days}d")
+        hours, remainder = divmod(remainder, 3600)
+        if hours:
+            parts.append(f"{hours}h")
+        minutes, remainder = divmod(remainder, 60)
+        if minutes:
+            parts.append(f"{minutes}m")
+        if remainder or not parts:
+            parts.append(f"{remainder}s")
+        return " ".join(parts)
+
+    @staticmethod
+    def _format_duration_with_seconds(seconds: Optional[float]) -> str:
+        """Return duration with both pretty form and raw seconds."""
+        if seconds is None:
+            return "unknown"
+        total_seconds = int(round(max(0.0, seconds)))
+        pretty = TimelapseBackup._format_duration(total_seconds)
+        return f"{pretty} ({total_seconds:,} seconds)"
+
+    @staticmethod
+    def _format_float(value: Optional[float], decimals: int = 2) -> str:
+        """Format a float with thousands separators and fixed decimals."""
+        if value is None:
+            return "unknown"
+        format_spec = f",.{decimals}f"
+        return format(value, format_spec)
+
+    @staticmethod
+    def _format_timestamp(ts: Optional[str]) -> str:
+        """Return timestamp string or fallback."""
+        return ts if ts else "unknown"
+
+    def _build_stats_report(
+        self,
+        slug: str,
+        name: str,
+        mode: str,
+        label: str,
+        output_path: Path,
+        generated_at: datetime,
+        stats: Dict[str, Any],
+    ) -> str:
+        """Render a human-readable stats report."""
+        lines: List[str] = []
+        lines.append("Timelapse Report")
+        lines.append("----------------")
+        lines.append(f"Timelapse: {name} ({slug})")
+        lines.append(f"Mode: {mode}")
+        lines.append(f"Label: {label}")
+        lines.append(f"Output video: {output_path}")
+        stamp = generated_at.replace(microsecond=0).isoformat()
+        lines.append(f"Generated at: {stamp}Z")
+        lines.append("")
+
+        lines.append("Frame Overview")
+        lines.append("--------------")
+        frames_rendered = stats.get("rendered_frames", 0)
+        lines.append(f"Frames rendered: {frames_rendered:,}")
+        lines.append(f"Frames with change: {stats.get('frames_with_change', 0):,}")
+        lines.append(f"Frames without change: {stats.get('frames_without_change', 0):,}")
+        excluded_frames = stats.get("frames_excluded_from_stats", 0)
+        if excluded_frames:
+            lines.append(f"Frames excluded from change stats: {excluded_frames:,}")
+        lines.append("")
+
+        lines.append("Change Metrics")
+        lines.append("--------------")
+        total_pixels = stats.get("total_changed_pixels", 0)
+        lines.append(f"Total changed pixels: {total_pixels:,}")
+        avg_pixels = stats.get("average_pixels_per_frame")
+        lines.append(f"Average pixels per frame: {self._format_float(avg_pixels)}")
+        total_time = stats.get("total_time_invested_seconds")
+        lines.append(f"Total time invested: {self._format_duration_with_seconds(total_time)}")
+        avg_time = stats.get("average_time_per_frame_seconds")
+        lines.append(f"Average time per frame: {self._format_duration_with_seconds(avg_time)}")
+        peak_pixels = stats.get("max_change_pixels", 0)
+        peak_ts = self._format_timestamp(stats.get("max_change_frame_timestamp"))
+        lines.append(f"Peak change: {peak_pixels:,} pixels at {peak_ts}")
+        lines.append("")
+
+        lines.append("Timeline")
+        lines.append("--------")
+        start_ts = self._format_timestamp(stats.get("start_timestamp"))
+        end_ts = self._format_timestamp(stats.get("end_timestamp"))
+        lines.append(f"First frame: {start_ts}")
+        lines.append(f"Last frame: {end_ts}")
+        coverage_span = self._format_duration_with_seconds(stats.get("total_duration_seconds"))
+        lines.append(f"Coverage span: {coverage_span}")
+        capture = stats.get("capture_interval_seconds", {})
+        avg_capture = self._format_duration_with_seconds(capture.get("average"))
+        min_capture = self._format_duration_with_seconds(capture.get("minimum"))
+        max_capture = self._format_duration_with_seconds(capture.get("maximum"))
+        lines.append(f"Capture interval (avg / min / max): {avg_capture} / {min_capture} / {max_capture}")
+        lines.append("")
+
+        lines.append("Idle Periods")
+        lines.append("------------")
+        idle_frames = stats.get("longest_idle_run_frames", 0)
+        if idle_frames:
+            idle_duration = self._format_duration_with_seconds(stats.get("longest_idle_run_duration_seconds"))
+            idle_start = self._format_timestamp(stats.get("longest_idle_run_start_timestamp"))
+            lines.append(f"Longest idle run: {idle_frames:,} frames over {idle_duration}, starting {idle_start}")
+        else:
+            lines.append("Longest idle run: none detected")
+        lines.append("")
+
+        lines.append("Coverage Gaps")
+        lines.append("-------------")
+        gaps = stats.get("coverage_gaps")
+        if not gaps:
+            lines.append("None observed")
+        else:
+            count = gaps.get("count", 0)
+            longest_gap = self._format_duration_with_seconds(gaps.get("max_duration_seconds"))
+            lines.append(f"Tracked gaps: {count} (longest {longest_gap})")
+            examples = gaps.get("examples") or []
+            for idx, gap in enumerate(examples, start=1):
+                duration_text = self._format_duration_with_seconds(gap.get("duration_seconds"))
+                gap_start = self._format_timestamp(gap.get("start"))
+                gap_end = self._format_timestamp(gap.get("end"))
+                lines.append(f"  {idx}. {duration_text} from {gap_start} to {gap_end}")
+
+        lines.append("")
+        return "\n".join(lines)
+
     def _encode_with_ffmpeg(
         self,
         frame_iter: Iterable[bytes],
@@ -897,11 +1269,18 @@ class TimelapseBackup:
 
         temp_output.replace(output_path)
         
-    def create_differential_frame(self, prev_frame: np.ndarray, curr_frame: np.ndarray) -> np.ndarray:
-        """Create differential frame showing changes between two frames"""
+    def create_differential_frame(
+        self,
+        prev_frame: Optional[np.ndarray],
+        curr_frame: np.ndarray,
+        return_stats: bool = False,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
+        """Create differential frame showing changes between two frames."""
+        changed_pixels = 0
         if prev_frame is None:
             # First frame - return configured background color
-            return np.full_like(curr_frame, self.background_color)
+            frame = np.full_like(curr_frame, self.background_color)
+            return (frame, changed_pixels) if return_stats else frame
             
         # Calculate absolute difference
         diff = cv2.absdiff(prev_frame, curr_frame)
@@ -912,8 +1291,10 @@ class TimelapseBackup:
             gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             _, binary_diff = cv2.threshold(gray_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
             result = background.copy()
-            result[binary_diff > 0] = (255, 255, 255)
-            return result
+            mask = binary_diff > 0
+            result[mask] = (255, 255, 255)
+            changed_pixels = int(np.count_nonzero(mask))
+            return (result, changed_pixels) if return_stats else result
             
         elif self.diff_visualization == 'heatmap':
             # Heatmap: color-coded intensity of changes
@@ -928,7 +1309,8 @@ class TimelapseBackup:
             result = background.copy()
             mask = thresholded > 0
             result[mask] = heatmap[mask]
-            return result
+            changed_pixels = int(np.count_nonzero(mask))
+            return (result, changed_pixels) if return_stats else result
             
         elif self.diff_visualization == 'overlay':
             # Overlay: changes highlighted on semi-transparent background
@@ -942,7 +1324,8 @@ class TimelapseBackup:
             # Blend with original frame
             alpha = 0.7
             result = cv2.addWeighted(curr_frame, alpha, overlay, 1-alpha, 0)
-            return result
+            changed_pixels = int(np.count_nonzero(mask))
+            return (result, changed_pixels) if return_stats else result
             
         elif self.diff_visualization == 'colored':
             # Colored difference: green for additions, red for removals
@@ -962,15 +1345,18 @@ class TimelapseBackup:
             enhanced_diff = np.clip(enhanced_diff, 0, 255).astype(np.uint8)
             
             result = background.copy()
-            result[mask > 0] = enhanced_diff[mask > 0]
-            return result
+            change_mask = mask > 0
+            result[change_mask] = enhanced_diff[change_mask]
+            changed_pixels = int(np.count_nonzero(change_mask))
+            return (result, changed_pixels) if return_stats else result
             
         else:
             # Default to absolute difference
             result = background.copy()
             diff_mask = np.any(diff > 0, axis=2)
             result[diff_mask] = diff[diff_mask]
-            return result
+            changed_pixels = int(np.count_nonzero(diff_mask))
+            return (result, changed_pixels) if return_stats else result
     
     def get_enabled_timelapse_modes(self, timelapse_config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Get list of enabled timelapse modes for a timelapse"""
@@ -1179,44 +1565,82 @@ class TimelapseBackup:
         slug: str,
         name: str,
         label: str,
-    ) -> Iterable[bytes]:
-        """Yield encoded PNG data for prepared frames in order."""
+        frame_datetimes: List[Optional[datetime]],
+    ) -> Tuple[Iterator[bytes], TimelapseStatsCollector]:
+        """Yield encoded PNG data for prepared frames in order while collecting stats."""
         total_frames = len(prepared_frames)
         if total_frames == 0:
-            return
+            return iter(()), TimelapseStatsCollector(frame_datetimes)
 
         progress_interval = max(1, total_frames // 20)
-        prev_composite_color: Optional[np.ndarray] = None
+        stats_collector = TimelapseStatsCollector(frame_datetimes)
+        historical_cutoff = getattr(self, "historical_cutoff", None)
 
-        for index, prepared in enumerate(prepared_frames, start=1):
-            if prepared.temp_path is None:
-                continue
+        def generator() -> Iterator[bytes]:
+            prev_composite_color: Optional[np.ndarray] = None
+            prev_frame_timestamp: Optional[datetime] = None
 
-            if mode_name == "diff":
-                composite_color = cv2.imread(str(prepared.temp_path), cv2.IMREAD_COLOR)
-                if composite_color is None:
-                    raise RuntimeError(
-                        f"Failed to read prepared composite for diff mode: {prepared.temp_path}"
-                    )
-                frame = self.create_differential_frame(prev_composite_color, composite_color)
-                prev_composite_color = composite_color
-                success, buffer = cv2.imencode(".png", frame)
-                if not success:
-                    raise RuntimeError(
-                        f"Failed to encode differential frame for '{name}' ({slug}) {mode_name} {label}"
-                    )
-                frame_bytes = buffer.tobytes()
-            else:
-                frame_bytes = prepared.temp_path.read_bytes()
+            for zero_based_index, prepared in enumerate(prepared_frames):
+                if prepared.temp_path is None:
+                    stats_collector.record(zero_based_index, None)
+                    continue
 
-            yield frame_bytes
-
-            if index % progress_interval == 0 or index == total_frames:
-                percent = (index / total_frames) * 100.0
-                self.logger.info(
-                    f"Encoding progress for '{name}' ({slug}) {mode_name} {label}: "
-                    f"{index}/{total_frames} frames ({percent:.1f}%)"
+                frame_timestamp = (
+                    frame_datetimes[zero_based_index]
+                    if zero_based_index < len(frame_datetimes)
+                    else None
                 )
+                is_historical = (
+                    historical_cutoff is not None
+                    and frame_timestamp is not None
+                    and frame_timestamp < historical_cutoff
+                )
+                prev_is_historical = (
+                    historical_cutoff is not None
+                    and prev_frame_timestamp is not None
+                    and prev_frame_timestamp < historical_cutoff
+                )
+                exclude_change_stats = is_historical or prev_is_historical
+
+                if mode_name == "diff":
+                    composite_color = cv2.imread(str(prepared.temp_path), cv2.IMREAD_COLOR)
+                    if composite_color is None:
+                        raise RuntimeError(
+                            f"Failed to read prepared composite for diff mode: {prepared.temp_path}"
+                        )
+                    frame, changed_pixels = self.create_differential_frame(
+                        prev_composite_color,
+                        composite_color,
+                        return_stats=True,
+                    )
+                    prev_composite_color = composite_color
+                    success, buffer = cv2.imencode(".png", frame)
+                    if not success:
+                        raise RuntimeError(
+                            f"Failed to encode differential frame for '{name}' ({slug}) {mode_name} {label}"
+                        )
+                    frame_bytes = buffer.tobytes()
+                else:
+                    frame_bytes = prepared.temp_path.read_bytes()
+                    changed_pixels = None
+
+                stats_collector.record(
+                    zero_based_index,
+                    None if exclude_change_stats else changed_pixels,
+                )
+                if frame_timestamp is not None:
+                    prev_frame_timestamp = frame_timestamp
+                yield frame_bytes
+
+                frame_number = zero_based_index + 1
+                if frame_number % progress_interval == 0 or frame_number == total_frames:
+                    percent = (frame_number / total_frames) * 100.0
+                    self.logger.info(
+                        f"Encoding progress for '{name}' ({slug}) {mode_name} {label}: "
+                        f"{frame_number}/{total_frames} frames ({percent:.1f}%)"
+                    )
+
+        return generator(), stats_collector
 
     def render_timelapse_from_sessions(
         self,
@@ -1367,18 +1791,35 @@ class TimelapseBackup:
                     f"from original {frame_width}x{frame_height}"
                 )
 
+            frame_datetimes: List[Optional[datetime]] = [
+                self._parse_session_datetime(frame.session_dir)
+                for frame in prepared_frames
+            ]
+
+            gap_threshold: Optional[timedelta] = None
+            gap_multiplier = getattr(self, "coverage_gap_multiplier", None)
+            if (
+                gap_multiplier is not None
+                and gap_multiplier > 0
+                and getattr(self, "backup_interval", 0) > 0
+            ):
+                gap_threshold = timedelta(
+                    minutes=self.backup_interval * gap_multiplier
+                )
+
             total_frames = len(prepared_frames)
             self.logger.info(
                 f"Streaming {total_frames} frames to FFmpeg for '{name}' ({slug}) {mode_name} {label}"
             )
 
             try:
-                frame_iter = self._frame_byte_generator(
+                frame_iter, stats_collector = self._frame_byte_generator(
                     prepared_frames,
                     mode_name,
                     slug,
                     name,
                     label,
+                    frame_datetimes,
                 )
                 self._encode_with_ffmpeg(frame_iter, output_path, self.fps, crop_bounds)
             except subprocess.CalledProcessError as exc:
@@ -1386,6 +1827,32 @@ class TimelapseBackup:
                     f"FFmpeg encoding failed for '{name}' ({slug}) {mode_name} {label}: {exc.stderr or exc}"
                 )
                 raise
+            else:
+                if getattr(self, "reporting_enabled", False):
+                    stats_summary = stats_collector.summarize(
+                        gap_threshold,
+                        seconds_per_pixel=getattr(self, "seconds_per_pixel", 30),
+                    )
+                    generated_at = datetime.utcnow()
+                    report_text = self._build_stats_report(
+                        slug=slug,
+                        name=name,
+                        mode=mode_name,
+                        label=label,
+                        output_path=output_path,
+                        generated_at=generated_at,
+                        stats=stats_summary,
+                    )
+                    stats_path = output_path.with_suffix(output_path.suffix + ".stats.txt")
+                    try:
+                        stats_path.write_text(
+                            report_text,
+                            encoding="utf-8",
+                        )
+                    except OSError as exc:
+                        self.logger.error(
+                            f"Failed to write stats file for '{name}' ({slug}) {mode_name} {label}: {exc}"
+                        )
 
         self.logger.info(
             f"{mode_name.title()} timelapse created for '{name}' ({slug}): {output_path} ({total_frames} frames)"
