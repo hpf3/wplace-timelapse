@@ -259,6 +259,74 @@ class TimelapseBackup:
     def get_enabled_timelapses(self) -> List[Dict[str, Any]]:
         """Get list of enabled timelapse configurations"""
         return [tl for tl in self.config['timelapses'] if tl.get('enabled', True)]
+
+    def get_enabled_timelapse_modes(
+        self,
+        timelapse_config: Union[Dict[str, Any], TimelapseConfig],
+    ) -> List[Dict[str, Any]]:
+        """Return enabled rendering modes for a timelapse in legacy dict format."""
+        enabled_modes: List[Dict[str, Any]] = []
+
+        if isinstance(timelapse_config, TimelapseConfig):
+            for mode in timelapse_config.enabled_modes():
+                enabled_modes.append(
+                    {
+                        "mode": mode.name,
+                        "suffix": mode.suffix,
+                        "create_full": mode.create_full_timelapse,
+                    }
+                )
+        else:
+            raw_modes = {}
+            if isinstance(timelapse_config, dict):
+                raw_modes = timelapse_config.get("timelapse_modes", {})
+
+            if isinstance(raw_modes, dict):
+                for mode_name, raw_mode in raw_modes.items():
+                    if not isinstance(raw_mode, dict):
+                        continue
+                    if not self._parse_bool(raw_mode.get("enabled"), True):
+                        continue
+                    create_full_value = raw_mode.get("create_full")
+                    if create_full_value is None:
+                        create_full_value = raw_mode.get("create_full_timelapse")
+                    enabled_modes.append(
+                        {
+                            "mode": mode_name,
+                            "suffix": str(raw_mode.get("suffix", "")),
+                            "create_full": self._parse_bool(create_full_value, False),
+                        }
+                    )
+            elif isinstance(raw_modes, list):
+                for entry in raw_modes:
+                    if isinstance(entry, str):
+                        enabled_modes.append(
+                            {"mode": entry, "suffix": "", "create_full": False}
+                        )
+                    elif isinstance(entry, dict):
+                        mode_name = str(entry.get("mode") or entry.get("name") or "normal")
+                        if not self._parse_bool(entry.get("enabled"), True):
+                            continue
+                        create_full_value = entry.get("create_full")
+                        if create_full_value is None:
+                            create_full_value = entry.get("create_full_timelapse")
+                        enabled_modes.append(
+                            {
+                                "mode": mode_name,
+                                "suffix": str(entry.get("suffix", "")),
+                                "create_full": self._parse_bool(create_full_value, False),
+                            }
+                        )
+
+        if not enabled_modes:
+            enabled_modes.append(
+                {
+                    "mode": "normal",
+                    "suffix": "",
+                    "create_full": False,
+                }
+            )
+        return enabled_modes
         
     def setup_logging(self):
         """Setup logging configuration"""
