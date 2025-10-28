@@ -13,6 +13,11 @@ fi
 export PYTHONUNBUFFERED=1
 cd /app/src
 
+if [ "${SKIP_MIGRATIONS:-0}" != "1" ]; then
+  echo "Running startup migrations"
+  python -m timelapse_backup.migrations
+fi
+
 if [ "${SKIP_PREBACKUP_CLEANUP:-0}" != "1" ]; then
   CLEANUP_CMD="python cleanup_backups.py --cache-root /data/cache ${CLEANUP_EXTRA_ARGS:-}"
   echo "Starting cleanup_backups.py in background: ${CLEANUP_CMD}"

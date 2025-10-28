@@ -55,7 +55,7 @@ def create_daily_timelapse(backup: Any, date: Optional[datetime] = None) -> None
 
             if mode.get("create_full"):
                 full_session_dirs = get_all_sessions(backup.backup_dir, slug)
-                backup.render_timelapse_from_sessions(
+                backup.render_incremental_full_timelapse(
                     slug,
                     name,
                     timelapse,
@@ -87,7 +87,7 @@ def create_full_timelapses(backup: Any) -> None:
 
         session_dirs = get_all_sessions(backup.backup_dir, slug)
         for mode in enabled_modes:
-            backup.render_timelapse_from_sessions(
+            backup.render_incremental_full_timelapse(
                 slug,
                 name,
                 timelapse,
@@ -127,9 +127,10 @@ def run(backup: Any) -> None:
     """Run the backup system with scheduled tasks."""
     scheduler = BlockingScheduler()
 
-    scheduler.add_job(
+    interval_trigger = IntervalTrigger(minutes=backup.backup_interval)
+    backup_job = scheduler.add_job(
         backup.backup_tiles,
-        trigger=IntervalTrigger(minutes=backup.backup_interval),
+        trigger=interval_trigger,
         id="backup_tiles",
         name="Backup Tiles",
         max_instances=1,
@@ -159,8 +160,32 @@ def run(backup: Any) -> None:
             coords["ymax"],
         )
 
+    interval_delta = timedelta(minutes=backup.backup_interval)
+    last_capture_time: Optional[datetime] = None
+    if hasattr(backup, "get_last_capture_time"):
+        last_capture_time = backup.get_last_capture_time()
+
+    now = datetime.now()
+    next_run_time = now
+    if last_capture_time is not None:
+        candidate = last_capture_time + interval_delta
+        if candidate > now:
+            next_run_time = candidate
+            backup.logger.info(
+                "Delaying first capture until %s to respect configured interval",
+                candidate.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+    backup_job.modify(next_run_time=next_run_time)
+    if next_run_time <= now:
+        backup.logger.info("Initial capture scheduled immediately")
+    else:
+        backup.logger.info(
+            "Initial capture scheduled for %s",
+            next_run_time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
     try:
-        backup.backup_tiles()
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         backup.logger.info("Timelapse backup system stopped")

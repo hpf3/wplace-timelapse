@@ -7,6 +7,7 @@ import os
 import logging
 import cv2
 import numpy as np
+import shutil
 import time
 import subprocess
 import uuid
@@ -25,11 +26,16 @@ from timelapse_backup.config import (
     _parse_positive_int as config_parse_positive_int,
     load_config,
 )
+from timelapse_backup.full_timelapse import (
+    FullTimelapseSegment,
+    FullTimelapseState,
+)
 from timelapse_backup.logging_setup import configure_logging
 from timelapse_backup.models import (
     CompositeFrame,
     FrameManifest,
     PreparedFrame,
+    RenderedTimelapseResult,
 )
 from timelapse_backup.stats import TimelapseStatsCollector, build_stats_report
 from timelapse_backup.sessions import (
@@ -259,6 +265,23 @@ class TimelapseBackup:
     def get_enabled_timelapses(self) -> List[Dict[str, Any]]:
         """Get list of enabled timelapse configurations"""
         return [tl for tl in self.config['timelapses'] if tl.get('enabled', True)]
+
+    def get_last_capture_time(self) -> Optional[datetime]:
+        """Return the most recent session timestamp across enabled timelapses."""
+        latest: Optional[datetime] = None
+        for timelapse in self.get_enabled_timelapses():
+            slug = timelapse.get("slug")
+            if not slug:
+                continue
+            sessions = get_all_sessions(self.backup_dir, slug)
+            if not sessions:
+                continue
+            session_time = parse_session_datetime(sessions[-1])
+            if session_time is None:
+                continue
+            if latest is None or session_time > latest:
+                latest = session_time
+        return latest
 
     def get_enabled_timelapse_modes(
         self,
@@ -542,6 +565,51 @@ class TimelapseBackup:
             quality=getattr(self, "quality", 20),
         )
 
+    def _remux_segments_with_ffmpeg(
+        self,
+        concat_path: Path,
+        output_path: Path,
+    ) -> None:
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "ffmpeg not found on PATH. Install ffmpeg with libx264/libx265/libsvtav1."
+            )
+
+        temp_output = output_path.with_name(f".tmp_{uuid.uuid4().hex}_{output_path.name}")
+        if temp_output.exists():
+            temp_output.unlink()
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(temp_output),
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                cmd,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+
+        temp_output.replace(output_path)
+
 
 
     def create_differential_frame(
@@ -628,8 +696,12 @@ class TimelapseBackup:
         suffix: str,
         output_filename: str,
         label: str
-    ):
-        """Create timelapse from a pre-collected list of session directories"""
+    ) -> Optional[RenderedTimelapseResult]:
+        """Create timelapse from a pre-collected list of session directories.
+
+        Returns:
+            RenderedTimelapseResult if frames were rendered, otherwise None.
+        """
         if not session_dirs:
             self.logger.warning(
                 "No session directories found for '%s' (%s) %s",
@@ -637,7 +709,7 @@ class TimelapseBackup:
                 slug,
                 label,
             )
-            return
+            return None
 
         self.logger.info(
             "Creating %s timelapse for '%s' (%s) %s with %s frames",
@@ -657,7 +729,7 @@ class TimelapseBackup:
                 mode_name,
                 label,
             )
-            return
+            return None
 
         manifests = self._build_frame_manifests(
             session_dirs,
@@ -676,14 +748,16 @@ class TimelapseBackup:
                 mode_name,
                 label,
             )
-            return
+            return None
 
         output_dir = self.output_dir / slug
         output_dir.mkdir(exist_ok=True)
         output_path = output_dir / output_filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
         renderer = self._get_renderer()
         total_frames = 0
+        rendered_session_dirs: List[Path] = []
 
         with tempfile.TemporaryDirectory() as temp_dir_str:
             temp_dir = Path(temp_dir_str)
@@ -705,7 +779,7 @@ class TimelapseBackup:
                     mode_name,
                     label,
                 )
-                return
+                return None
 
             try:
                 crop_bounds, _ = renderer.compute_crop_bounds(
@@ -723,6 +797,7 @@ class TimelapseBackup:
                 parse_session_datetime(frame.session_dir)
                 for frame in prepared_frames
             ]
+            rendered_session_dirs = [frame.session_dir for frame in prepared_frames]
 
             gap_threshold: Optional[timedelta] = None
             gap_multiplier = getattr(self, "coverage_gap_multiplier", None)
@@ -804,6 +879,153 @@ class TimelapseBackup:
             slug,
             output_path,
             total_frames,
+        )
+        return RenderedTimelapseResult(
+            output_path=output_path,
+            frame_count=total_frames,
+            session_dirs=tuple(rendered_session_dirs),
+        )
+
+    def render_incremental_full_timelapse(
+        self,
+        slug: str,
+        name: str,
+        timelapse_config: Dict[str, Any],
+        session_dirs: List[Path],
+        mode_name: str,
+        suffix: str,
+        output_filename: str,
+        label: str,
+    ) -> None:
+        """Render and append only new sessions to the full-history timelapse."""
+        slug_dir = self.output_dir / slug
+        slug_dir.mkdir(exist_ok=True)
+
+        state = FullTimelapseState(
+            slug_dir,
+            output_filename,
+            logger=self.logger,
+        )
+        state.load()
+
+        pending_sessions = state.pending_sessions(session_dirs)
+        if not pending_sessions:
+            self.logger.info(
+                "Full timelapse up to date for '%s' (%s) %s %s",
+                name,
+                slug,
+                mode_name,
+                label,
+            )
+            return
+
+        state.ensure_segments_dir()
+        temp_segment_rel = Path("segments") / state.output_basename / f"tmp_{uuid.uuid4().hex}.mp4"
+        temp_segment_rel_str = temp_segment_rel.as_posix()
+
+        try:
+            render_result = self.render_timelapse_from_sessions(
+                slug=slug,
+                name=name,
+                timelapse_config=timelapse_config,
+                session_dirs=pending_sessions,
+                mode_name=mode_name,
+                suffix=suffix,
+                output_filename=temp_segment_rel_str,
+                label=f"{label} (segment)",
+            )
+        except subprocess.CalledProcessError:
+            # render_timelapse_from_sessions already logged details
+            return
+
+        temp_segment_path = slug_dir / temp_segment_rel
+        if render_result is None or render_result.frame_count == 0:
+            temp_segment_path.unlink(missing_ok=True)
+            self.logger.info(
+                "Skipping full timelapse update for '%s' (%s) %s %s; no frames rendered",
+                name,
+                slug,
+                mode_name,
+                label,
+            )
+            return
+
+        encoded_sessions = list(render_result.session_dirs)
+        if not encoded_sessions:
+            temp_segment_path.unlink(missing_ok=True)
+            self.logger.warning(
+                "Skipping full timelapse update for '%s' (%s) %s %s; no encoded sessions returned",
+                name,
+                slug,
+                mode_name,
+                label,
+            )
+            return
+
+        first_dt = parse_session_datetime(encoded_sessions[0])
+        last_dt = parse_session_datetime(encoded_sessions[-1])
+        if first_dt is None or last_dt is None:
+            temp_segment_path.unlink(missing_ok=True)
+            self.logger.warning(
+                "Unable to derive session timestamps for full timelapse '%s' (%s) %s %s; skipping update",
+                name,
+                slug,
+                mode_name,
+                label,
+            )
+            return
+
+        segment_path = state.make_segment_filename(first_dt, last_dt)
+        segment_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Ensure unique segment names; replace duplicates to keep manifest clean.
+        if segment_path.exists():
+            segment_path.unlink()
+
+        temp_segment_path.replace(segment_path)
+        relative_segment_path = segment_path.relative_to(slug_dir)
+
+        new_segment = FullTimelapseSegment(
+            path=relative_segment_path.as_posix(),
+            first_session=first_dt.replace(microsecond=0).isoformat(),
+            last_session=last_dt.replace(microsecond=0).isoformat(),
+            frame_count=render_result.frame_count,
+        )
+
+        updated_segments = [*state.segments, new_segment]
+        concat_temp_path = state.write_concat_file(
+            updated_segments,
+            temporary=True,
+        )
+
+        full_output_path = slug_dir / output_filename
+        try:
+            self._remux_segments_with_ffmpeg(concat_temp_path, full_output_path)
+        except subprocess.CalledProcessError as exc:
+            segment_path.unlink(missing_ok=True)
+            self.logger.error(
+                "Failed to append to full timelapse for '%s' (%s) %s %s: %s",
+                name,
+                slug,
+                mode_name,
+                label,
+                exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else exc,
+            )
+            return
+        finally:
+            concat_temp_path.unlink(missing_ok=True)
+
+        state.add_segment(new_segment)
+        state.write_concat_file(temporary=False)
+        state.save()
+
+        self.logger.info(
+            "Full timelapse updated for '%s' (%s) %s %s with %s new frames",
+            name,
+            slug,
+            mode_name,
+            label,
+            render_result.frame_count,
         )
 
     def create_daily_timelapse(self, date: datetime = None):

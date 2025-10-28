@@ -36,8 +36,18 @@ class PreparedFrame:
     alpha_bounds: Optional[Tuple[int, int, int, int]]
 
 
+@dataclass
+class RenderedTimelapseResult:
+    """Summary of a rendered timelapse clip."""
+
+    output_path: Path
+    frame_count: int
+    session_dirs: Tuple[Path, ...]
+
+
 __all__ = [
     "CompositeFrame",
     "FrameManifest",
     "PreparedFrame",
+    "RenderedTimelapseResult",
 ]
