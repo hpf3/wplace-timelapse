@@ -11,6 +11,7 @@ steps:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_ROOT_USER_ACTION: ignore
     commands:
+      - apt-get update && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
       - python -m pip install --upgrade pip
       - pip install --no-cache-dir -r requirements.txt pytest
       - pytest -q
