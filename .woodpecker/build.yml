@@ -1,0 +1,40 @@
+when:
+  event: [push, manual]
+
+# Clone the repo as usual so the Dockerfile can COPY the workspace
+skip_clone: false
+
+steps:
+  - name: tests
+    image: python:3.13-slim
+    environment:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+    commands:
+      - python -m pip install --upgrade pip
+      - pip install --no-cache-dir -r requirements.txt
+      - pytest -q
+
+  - name: docker-build-and-push
+    image: docker:stable
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      GHCR_USER:
+        from_secret: ghcr_user
+      GHCR_TOKEN:
+        from_secret: ghcr_token
+    commands:
+      - docker login ghcr.io -u $${GHCR_USER} -p $${GHCR_TOKEN}
+      - |
+        docker build \
+          --pull \
+          --file images/WplaceRecorder/Dockerfile \
+          --tag ghcr.io/${CI_REPO_OWNER}/${CI_REPO_NAME}:latest \
+          .
+      - docker push ghcr.io/${CI_REPO_OWNER}/${CI_REPO_NAME}:latest
+    depends_on:
+      - tests
+    when:
+      branch:
+        - main
