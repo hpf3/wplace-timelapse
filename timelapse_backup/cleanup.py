@@ -81,6 +81,19 @@ class CachePaths:
     archives_dir: Path
 
 
+@dataclass
+class _ReleaseAssignment:
+    slug_config: SlugConfig
+    gap: GapInfo
+    session_dir: Path
+
+
+@dataclass
+class _ReleaseWork:
+    candidate: ReleaseCandidate
+    assignments: list[_ReleaseAssignment]
+
+
 class ConcatenatedReader(io.RawIOBase):
     """Expose multiple file parts as a single readable stream."""
 
@@ -448,7 +461,7 @@ class CleanupManager:
             self.logger.info("No historical releases found between %s and %s", earliest, latest)
             return
 
-        grouped: dict[str, list[tuple[GapInfo, ReleaseCandidate]]] = {}
+        assignments_by_release: dict[str, _ReleaseWork] = {}
         for gap in all_gaps:
             matches = [
                 candidate
@@ -463,12 +476,32 @@ class CleanupManager:
                     gap.slug,
                 )
                 continue
-            grouped.setdefault(gap.slug, []).extend((gap, candidate) for candidate in matches)
+            slug_config = self.slug_configs[gap.slug]
+            for candidate in matches:
+                session_dir = self._prepare_session_dir(slug_config.slug, candidate.capture_time)
+                work = assignments_by_release.setdefault(
+                    candidate.release.tag,
+                    _ReleaseWork(candidate=candidate, assignments=[]),
+                )
+                if any(item.session_dir == session_dir for item in work.assignments):
+                    continue
+                work.assignments.append(
+                    _ReleaseAssignment(
+                        slug_config=slug_config,
+                        gap=gap,
+                        session_dir=session_dir,
+                    )
+                )
 
-        for slug, assignments in grouped.items():
-            slug_config = self.slug_configs[slug]
-            for gap, candidate in assignments:
-                self._process_release_for_gap(slug_config, gap, candidate)
+        if not assignments_by_release:
+            self.logger.info("No matching releases for detected gaps; cleanup complete")
+            return
+
+        for work in sorted(
+            assignments_by_release.values(),
+            key=lambda item: item.candidate.capture_time,
+        ):
+            self._process_release_group(work)
 
     def _prepare_session_dir(self, slug: str, capture_time: datetime) -> Path:
         local_time = capture_time.astimezone(self.timezone)
@@ -490,12 +523,68 @@ class CleanupManager:
             else:
                 shutil.rmtree(entry, ignore_errors=True)
 
-    def _process_release_for_gap(
+    def _process_release_group(self, work: _ReleaseWork) -> None:
+        candidate = work.candidate
+        release_tag = candidate.release.tag
+        assignments = work.assignments
+        if not assignments:
+            return
+
+        self.logger.info(
+            "Processing release %s for %d gap(s)",
+            release_tag,
+            len(assignments),
+        )
+
+        if self.dry_run:
+            for assignment in assignments:
+                self.logger.info(
+                    "Dry run: would download %s and populate %s for gap %s -> %s",
+                    release_tag,
+                    assignment.session_dir,
+                    assignment.gap.start.isoformat(),
+                    assignment.gap.end.isoformat(),
+                )
+            return
+
+        self._clear_other_archives(keep=release_tag)
+
+        archive_dir = self.cache_paths.archives_dir / release_tag
+
+        downloaded = download_assets(
+            candidate.release,
+            destination=self.cache_paths.archives_dir,
+            skip_existing=True,
+        )
+        try:
+            has_assets = archive_dir.exists() and any(archive_dir.iterdir())
+        except OSError:
+            has_assets = False
+
+        if not downloaded and not has_assets:
+            self.logger.warning("No assets downloaded for release %s", release_tag)
+            return
+
+        for assignment in assignments:
+            self._populate_session_from_archive(
+                assignment=assignment,
+                candidate=candidate,
+                archive_dir=archive_dir,
+            )
+
+        if not self.keep_archives:
+            shutil.rmtree(archive_dir, ignore_errors=True)
+
+    def _populate_session_from_archive(
         self,
-        slug_config: SlugConfig,
-        gap: GapInfo,
+        assignment: _ReleaseAssignment,
         candidate: ReleaseCandidate,
+        archive_dir: Path,
     ) -> None:
+        slug_config = assignment.slug_config
+        gap = assignment.gap
+        session_dir = assignment.session_dir
+
         self.logger.info(
             "Processing release %s for %s gap %s -> %s",
             candidate.release.tag,
@@ -504,7 +593,6 @@ class CleanupManager:
             gap.end.isoformat(),
         )
 
-        session_dir = self._prepare_session_dir(slug_config.slug, candidate.capture_time)
         if session_dir.exists():
             try:
                 has_files = any(session_dir.iterdir())
@@ -513,27 +601,6 @@ class CleanupManager:
             if has_files:
                 self.logger.info("Session %s already populated; skipping", session_dir)
                 return
-
-        if self.dry_run:
-            self.logger.info(
-                "Dry run: would download %s and populate %s",
-                candidate.release.tag,
-                session_dir,
-            )
-            return
-
-        self._clear_other_archives(keep=candidate.release.tag)
-
-        archive_dir = self.cache_paths.archives_dir / candidate.release.tag
-
-        downloaded = download_assets(
-            candidate.release,
-            destination=self.cache_paths.archives_dir,
-            skip_existing=False,
-        )
-        if not downloaded:
-            self.logger.warning("No assets downloaded for release %s", candidate.release.tag)
-            return
 
         coords = list(slug_config.bounding_box.coordinates())
         extracted, missing = write_tiles_from_archive(
@@ -555,9 +622,6 @@ class CleanupManager:
                     session_dir.rmdir()
             except OSError:
                 pass
-
-        if not self.keep_archives:
-            shutil.rmtree(archive_dir, ignore_errors=True)
 
 
 __all__ = [
