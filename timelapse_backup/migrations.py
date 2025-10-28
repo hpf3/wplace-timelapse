@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import logging
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import re
+
+import cv2
+import cv2
 
 from timelapse_backup.app import TimelapseBackup
 from timelapse_backup.full_timelapse import (
@@ -121,6 +125,87 @@ def _parse_stats_report(stats_path: Path) -> StatsCoverage:
     return StatsCoverage(first_session=first, last_session=last, frame_count=frames)
 
 
+def _probe_video_dimensions(video_path: Path) -> Optional[Tuple[int, int]]:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        return None
+    try:
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    if width > 0 and height > 0:
+        return width, height
+    return None
+
+
+def _infer_crop_metadata(
+    backup: TimelapseBackup,
+    timelapse: Dict[str, Any],
+    session_dirs: List[Path],
+    mode_name: str,
+) -> Optional[Tuple[Tuple[int, int, int, int], Tuple[int, int]]]:
+    if not session_dirs:
+        return None
+
+    required_attrs = [
+        "get_tile_coordinates",
+        "_build_frame_manifests",
+        "_prepare_frames_from_manifests",
+        "_get_renderer",
+    ]
+    for attr in required_attrs:
+        if not hasattr(backup, attr):
+            return None
+
+    coordinates = backup.get_tile_coordinates(timelapse)
+    if not coordinates:
+        return None
+
+    slug = timelapse["slug"]
+    name = timelapse.get("name", slug)
+
+    manifests = backup._build_frame_manifests(  # type: ignore[attr-defined]
+        session_dirs,
+        timelapse,
+        coordinates,
+        slug,
+        name,
+        mode_name,
+        label="migration",
+    )
+    if not manifests:
+        return None
+
+    renderer = backup._get_renderer()  # type: ignore[attr-defined]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        prepared_frames = backup._prepare_frames_from_manifests(  # type: ignore[attr-defined]
+            manifests,
+            coordinates,
+            Path(temp_dir),
+            slug,
+            name,
+            mode_name,
+            "migration",
+        )
+        if not prepared_frames:
+            return None
+        try:
+            crop_bounds, original_shape = renderer.compute_crop_bounds(
+                prepared_frames,
+                slug=slug,
+                name=name,
+                mode_name=mode_name,
+                label="migration",
+            )
+        finally:
+            for frame in prepared_frames:
+                if frame.temp_path and frame.temp_path.exists():
+                    frame.temp_path.unlink(missing_ok=True)
+        return crop_bounds, original_shape
+
+
 def _prepare_segment_file(
     slug_dir: Path,
     output_filename: str,
@@ -195,6 +280,16 @@ def migrate_full_timelapse_segments(backup: TimelapseBackup) -> None:
                 _log_skip(slug, mode_name, suffix, "unable to derive session timestamps")
                 continue
 
+            cutoff_session_dirs: List[Path] = []
+            for session_dir in session_dirs:
+                session_dt = parse_session_datetime(session_dir)
+                if session_dt is None:
+                    continue
+                if session_dt <= last_dt:
+                    cutoff_session_dirs.append(session_dir)
+            if not cutoff_session_dirs:
+                cutoff_session_dirs = session_dirs
+
             state.ensure_segments_dir()
             segment_path = state.make_segment_filename(first_dt, last_dt)
             if segment_path.exists():
@@ -208,12 +303,47 @@ def migrate_full_timelapse_segments(backup: TimelapseBackup) -> None:
             if stats_info is not None and stats_info.frame_count is not None:
                 frame_count = stats_info.frame_count
             else:
-                frame_count = _estimate_frame_count(session_dirs)
+                frame_count = _estimate_frame_count(cutoff_session_dirs)
+
+            crop_info = _infer_crop_metadata(
+                backup,
+                timelapse,
+                cutoff_session_dirs,
+                mode_name,
+            )
+            if crop_info is not None:
+                crop_bounds, original_shape = crop_info
+                crop_x, crop_y, crop_x1, crop_y1 = crop_bounds
+                content_width = max(0, crop_x1 - crop_x)
+                content_height = max(0, crop_y1 - crop_y)
+            else:
+                crop_x = crop_y = 0
+                original_shape = None
+                content_width = None
+                content_height = None
+
+            dims = _probe_video_dimensions(segment_path)
+            video_width = dims[0] if dims else None
+            video_height = dims[1] if dims else None
+
+            if content_width is None and video_width is not None:
+                content_width = video_width
+            if content_height is None and video_height is not None:
+                content_height = video_height
+
             segment = FullTimelapseSegment(
                 path=relative_segment_path.as_posix(),
                 first_session=_safe_iso(first_dt),
                 last_session=_safe_iso(last_dt),
                 frame_count=frame_count,
+                video_width=video_width,
+                video_height=video_height,
+                content_width=content_width,
+                content_height=content_height,
+                crop_x=crop_x,
+                crop_y=crop_y,
+                pad_left=0,
+                pad_top=0,
             )
 
             state.segments = [segment]

@@ -606,9 +606,159 @@ class TimelapseBackup:
                 cmd,
                 output=result.stdout,
                 stderr=result.stderr,
-            )
+        )
 
         temp_output.replace(output_path)
+
+    @staticmethod
+    def _probe_video_dimensions(video_path: Path) -> Optional[Tuple[int, int]]:
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            capture.release()
+            return None
+        try:
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        finally:
+            capture.release()
+        if width > 0 and height > 0:
+            return width, height
+        return None
+
+    def _reframe_video_to_bounds(
+        self,
+        video_path: Path,
+        content_width: int,
+        content_height: int,
+        crop_left: int,
+        crop_top: int,
+        target_width: int,
+        target_height: int,
+        left_offset: int,
+        top_offset: int,
+    ) -> None:
+        if (
+            target_width <= 0
+            or target_height <= 0
+            or content_width <= 0
+            or content_height <= 0
+        ):
+            return
+
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "ffmpeg not found on PATH. Install ffmpeg with libx264/libx265/libsvtav1."
+            )
+
+        current_width: Optional[int] = None
+        current_height: Optional[int] = None
+        current_dims = self._probe_video_dimensions(video_path)
+        if current_dims is not None:
+            current_width, current_height = current_dims
+            if (
+                current_width == target_width
+                and current_height == target_height
+                and crop_left == left_offset
+                and crop_top == top_offset
+            ):
+                return
+            if content_width > current_width or content_height > current_height:
+                self.logger.warning(
+                    "Skipping reframe for %s; content bounds exceed current frame",
+                    video_path,
+                )
+                return
+
+        color_bgr = getattr(self, "background_color", (0, 0, 0))
+        r, g, b = color_bgr[2], color_bgr[1], color_bgr[0]
+        pad_color = f"0x{r:02X}{g:02X}{b:02X}"
+
+        temp_output = video_path.with_name(f".tmp_{uuid.uuid4().hex}_{video_path.name}")
+        if temp_output.exists():
+            temp_output.unlink()
+
+        crop_left = max(0, crop_left)
+        crop_top = max(0, crop_top)
+        left_offset = max(0, left_offset)
+        top_offset = max(0, top_offset)
+
+        if left_offset + content_width > target_width:
+            target_width = left_offset + content_width
+        if top_offset + content_height > target_height:
+            target_height = top_offset + content_height
+
+        if current_width is not None and crop_left + content_width > current_width:
+            self.logger.warning(
+                "Skipping reframe for %s; crop exceeds current width",
+                video_path,
+            )
+            return
+        if current_height is not None and crop_top + content_height > current_height:
+            self.logger.warning(
+                "Skipping reframe for %s; crop exceeds current height",
+                video_path,
+            )
+            return
+
+        crop_filter = f"crop={content_width}:{content_height}:{crop_left}:{crop_top}"
+        pad_filter = (
+            f"pad={target_width}:{target_height}:{left_offset}:{top_offset}:color={pad_color}"
+        )
+        filter_chain = f"{crop_filter},{pad_filter}"
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vf",
+            filter_chain,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "slow",
+            "-crf",
+            str(getattr(self, "quality", 20)),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(temp_output),
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                cmd,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+
+        temp_output.replace(video_path)
+
+    def _ensure_segment_dimensions(self, state: FullTimelapseState) -> None:
+        for segment in state.segments:
+            if segment.video_width is None or segment.video_height is None:
+                dims = self._probe_video_dimensions(state.segment_path(segment))
+                if dims is not None:
+                    segment.video_width, segment.video_height = dims
+            if segment.content_width is None and segment.video_width is not None:
+                segment.content_width = segment.video_width
+            if segment.content_height is None and segment.video_height is not None:
+                segment.content_height = segment.video_height
+            if segment.crop_x is None:
+                segment.crop_x = 0
+            if segment.crop_y is None:
+                segment.crop_y = 0
+            if segment.pad_left is None:
+                segment.pad_left = 0
+            if segment.pad_top is None:
+                segment.pad_top = 0
 
 
 
@@ -758,6 +908,12 @@ class TimelapseBackup:
         renderer = self._get_renderer()
         total_frames = 0
         rendered_session_dirs: List[Path] = []
+        rendered_video_width: Optional[int] = None
+        rendered_video_height: Optional[int] = None
+        rendered_content_width: Optional[int] = None
+        rendered_content_height: Optional[int] = None
+        rendered_crop_x: Optional[int] = None
+        rendered_crop_y: Optional[int] = None
 
         with tempfile.TemporaryDirectory() as temp_dir_str:
             temp_dir = Path(temp_dir_str)
@@ -782,16 +938,28 @@ class TimelapseBackup:
                 return None
 
             try:
-                crop_bounds, _ = renderer.compute_crop_bounds(
+                crop_bounds, original_shape = renderer.compute_crop_bounds(
                     prepared_frames,
                     slug=slug,
                     name=name,
                     mode_name=mode_name,
                     label=label,
                 )
+                x0, y0, x1, y1 = crop_bounds
+                rendered_crop_x = x0
+                rendered_crop_y = y0
+                content_width = max(0, x1 - x0)
+                content_height = max(0, y1 - y0)
+                if content_width == 0 or content_height == 0:
+                    content_width = original_shape[1]
+                    content_height = original_shape[0]
+                rendered_content_width = content_width
+                rendered_content_height = content_height
+                rendered_video_width = content_width
+                rendered_video_height = content_height
             except RuntimeError as exc:
                 self.logger.error(str(exc))
-                return
+                return None
 
             frame_datetimes: List[Optional[datetime]] = [
                 parse_session_datetime(frame.session_dir)
@@ -884,6 +1052,12 @@ class TimelapseBackup:
             output_path=output_path,
             frame_count=total_frames,
             session_dirs=tuple(rendered_session_dirs),
+            video_width=rendered_video_width,
+            video_height=rendered_video_height,
+            content_width=rendered_content_width,
+            content_height=rendered_content_height,
+            crop_x=rendered_crop_x,
+            crop_y=rendered_crop_y,
         )
 
     def render_incremental_full_timelapse(
@@ -985,11 +1159,139 @@ class TimelapseBackup:
         temp_segment_path.replace(segment_path)
         relative_segment_path = segment_path.relative_to(slug_dir)
 
+        # Harmonize segment framing so the concat muxer can copy streams.
+        self._ensure_segment_dimensions(state)
+
+        probe_dims = self._probe_video_dimensions(segment_path)
+        new_video_width = render_result.video_width or (probe_dims[0] if probe_dims else None)
+        new_video_height = render_result.video_height or (probe_dims[1] if probe_dims else None)
+        new_content_width = (
+            render_result.content_width
+            or render_result.video_width
+            or (probe_dims[0] if probe_dims else None)
+        )
+        new_content_height = (
+            render_result.content_height
+            or render_result.video_height
+            or (probe_dims[1] if probe_dims else None)
+        )
+        new_crop_x = render_result.crop_x if render_result.crop_x is not None else 0
+        new_crop_y = render_result.crop_y if render_result.crop_y is not None else 0
+
+        if new_content_width is None or new_content_height is None:
+            dims = self._probe_video_dimensions(segment_path)
+            if dims is None:
+                self.logger.error(
+                    "Unable to determine dimensions for new segment %s",
+                    segment_path,
+                )
+                return
+            new_content_width = dims[0]
+            new_content_height = dims[1]
+            if new_video_width is None:
+                new_video_width = dims[0]
+            if new_video_height is None:
+                new_video_height = dims[1]
+
+        existing_bounds = state.content_bounds()
+        min_x = new_crop_x
+        min_y = new_crop_y
+        max_x = new_crop_x + new_content_width
+        max_y = new_crop_y + new_content_height
+        if existing_bounds is not None:
+            min_x = min(min_x, existing_bounds[0])
+            min_y = min(min_y, existing_bounds[1])
+            max_x = max(max_x, existing_bounds[2])
+            max_y = max(max_y, existing_bounds[3])
+
+        target_width = max(0, max_x - min_x)
+        target_height = max(0, max_y - min_y)
+
+        if target_width == 0 or target_height == 0:
+            dims = self._probe_video_dimensions(segment_path)
+            if dims is not None:
+                target_width = dims[0]
+                target_height = dims[1]
+                min_x = min(min_x, 0)
+                min_y = min(min_y, 0)
+
+        if target_width % 2 != 0:
+            target_width += 1
+        if target_height % 2 != 0:
+            target_height += 1
+
+        # Reframe existing segments.
+        for segment in state.segments:
+            content_width = segment.content_width or segment.video_width
+            content_height = segment.content_height or segment.video_height
+            if content_width is None or content_height is None:
+                continue
+            left_offset = max(0, segment.crop_x - min_x)
+            top_offset = max(0, segment.crop_y - min_y)
+            needs_reframe = (
+                segment.video_width != target_width
+                or segment.video_height != target_height
+                or segment.pad_left != left_offset
+                or segment.pad_top != top_offset
+            )
+            if not needs_reframe:
+                continue
+
+            seg_path = state.segment_path(segment)
+            self.logger.info(
+                "Reframing legacy segment %s to %sx%s (offset %s,%s)",
+                seg_path,
+                target_width,
+                target_height,
+                left_offset,
+                top_offset,
+            )
+            self._reframe_video_to_bounds(
+                seg_path,
+                content_width,
+                content_height,
+                segment.pad_left or 0,
+                segment.pad_top or 0,
+                target_width,
+                target_height,
+                left_offset,
+                top_offset,
+            )
+            segment.video_width = target_width
+            segment.video_height = target_height
+            segment.pad_left = left_offset
+            segment.pad_top = top_offset
+
+        # Reframe new segment.
+        new_left_offset = max(0, new_crop_x - min_x)
+        new_top_offset = max(0, new_crop_y - min_y)
+        self._reframe_video_to_bounds(
+            segment_path,
+            new_content_width,
+            new_content_height,
+            0,
+            0,
+            target_width,
+            target_height,
+            new_left_offset,
+            new_top_offset,
+        )
+        new_video_width = target_width
+        new_video_height = target_height
+
         new_segment = FullTimelapseSegment(
             path=relative_segment_path.as_posix(),
             first_session=first_dt.replace(microsecond=0).isoformat(),
             last_session=last_dt.replace(microsecond=0).isoformat(),
             frame_count=render_result.frame_count,
+            video_width=new_video_width,
+            video_height=new_video_height,
+            content_width=new_content_width,
+            content_height=new_content_height,
+            crop_x=new_crop_x,
+            crop_y=new_crop_y,
+            pad_left=new_left_offset,
+            pad_top=new_top_offset,
         )
 
         updated_segments = [*state.segments, new_segment]

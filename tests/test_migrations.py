@@ -2,6 +2,14 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+import sys
+
+import cv2
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from timelapse_backup.full_timelapse import FullTimelapseState
 from timelapse_backup.migrations import migrate_full_timelapse_segments
@@ -29,9 +37,15 @@ class DummyBackup:
         return [{"mode": "normal", "suffix": "", "create_full": True}]
 
 
-def _write_dummy_video(path: Path) -> None:
+def _write_dummy_video(path: Path, *, width: int = 4, height: int = 4, frames: int = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"legacy mp4 data")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(path), fourcc, 5.0, (width, height))
+    assert writer.isOpened(), "Failed to create dummy video"
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    for _ in range(frames):
+        writer.write(frame)
+    writer.release()
 
 
 def _create_session(root: Path, slug: str, dt: datetime) -> Path:
@@ -54,7 +68,7 @@ def test_migration_creates_manifest_and_segment(tmp_path):
         session_dirs.append(_create_session(backup.backup_dir, slug, ts))
 
     legacy_full = slug_dir / "full.mp4"
-    _write_dummy_video(legacy_full)
+    _write_dummy_video(legacy_full, width=8, height=6, frames=42)
 
     stats_path = legacy_full.with_suffix(legacy_full.suffix + ".stats.txt")
     stats_path.write_text(
@@ -84,6 +98,14 @@ def test_migration_creates_manifest_and_segment(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["segments"][0]["path"].startswith("segments/full/")
     assert manifest["segments"][0]["frame_count"] == 42
+    assert manifest["segments"][0]["video_width"] == 8
+    assert manifest["segments"][0]["video_height"] == 6
+    assert manifest["segments"][0]["content_width"] == 8
+    assert manifest["segments"][0]["content_height"] == 6
+    assert manifest["segments"][0]["crop_x"] == 0
+    assert manifest["segments"][0]["crop_y"] == 0
+    assert manifest["segments"][0]["pad_left"] == 0
+    assert manifest["segments"][0]["pad_top"] == 0
     assert manifest["segments"][0]["first_session"] == start.isoformat()
     assert manifest["segments"][0]["last_session"] == mid.isoformat()
 
@@ -102,7 +124,7 @@ def test_migration_is_idempotent(tmp_path):
     start = datetime(2025, 1, 1, 0, 0, 0)
     _create_session(backup.backup_dir, slug, start)
     legacy_full = slug_dir / "full.mp4"
-    _write_dummy_video(legacy_full)
+    _write_dummy_video(legacy_full, width=4, height=4, frames=10)
 
     stats_path = legacy_full.with_suffix(legacy_full.suffix + ".stats.txt")
     stats_path.write_text(

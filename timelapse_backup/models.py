@@ -43,6 +43,12 @@ class RenderedTimelapseResult:
     output_path: Path
     frame_count: int
     session_dirs: Tuple[Path, ...]
+    video_width: Optional[int]
+    video_height: Optional[int]
+    content_width: Optional[int]
+    content_height: Optional[int]
+    crop_x: Optional[int]
+    crop_y: Optional[int]
 
 
 __all__ = [

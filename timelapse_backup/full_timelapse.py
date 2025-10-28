@@ -34,6 +34,14 @@ class FullTimelapseSegment:
     first_session: str
     last_session: str
     frame_count: int
+    video_width: Optional[int] = None
+    video_height: Optional[int] = None
+    content_width: Optional[int] = None
+    content_height: Optional[int] = None
+    crop_x: Optional[int] = None
+    crop_y: Optional[int] = None
+    pad_left: Optional[int] = None
+    pad_top: Optional[int] = None
 
     def first_datetime(self) -> datetime:
         return _from_iso(self.first_session)
@@ -102,11 +110,43 @@ class FullTimelapseState:
             if not isinstance(entry, dict):
                 continue
             try:
+                video_width = entry.get("video_width")
+                if video_width is None and "width" in entry:
+                    video_width = entry["width"]
+                video_height = entry.get("video_height")
+                if video_height is None and "height" in entry:
+                    video_height = entry["height"]
+                content_width = entry.get("content_width")
+                content_height = entry.get("content_height")
                 segment = FullTimelapseSegment(
                     path=str(entry["path"]),
                     first_session=str(entry["first_session"]),
                     last_session=str(entry["last_session"]),
                     frame_count=int(entry.get("frame_count", 0)),
+                    video_width=int(video_width) if video_width is not None else None,
+                    video_height=int(video_height) if video_height is not None else None,
+                    content_width=int(content_width) if content_width is not None else None,
+                    content_height=int(content_height) if content_height is not None else None,
+                    crop_x=(
+                        int(entry["crop_x"])
+                        if "crop_x" in entry and entry["crop_x"] is not None
+                        else None
+                    ),
+                    crop_y=(
+                        int(entry["crop_y"])
+                        if "crop_y" in entry and entry["crop_y"] is not None
+                        else None
+                    ),
+                    pad_left=(
+                        int(entry["pad_left"])
+                        if "pad_left" in entry and entry["pad_left"] is not None
+                        else None
+                    ),
+                    pad_top=(
+                        int(entry["pad_top"])
+                        if "pad_top" in entry and entry["pad_top"] is not None
+                        else None
+                    ),
                 )
             except KeyError:
                 continue
@@ -206,6 +246,44 @@ class FullTimelapseState:
 
         target.replace(self.concat_path)
         return self.concat_path
+
+    def max_dimensions(self) -> Tuple[Optional[int], Optional[int]]:
+        widths = [segment.video_width for segment in self.segments if segment.video_width]
+        heights = [segment.video_height for segment in self.segments if segment.video_height]
+        max_width = max(widths) if widths else None
+        max_height = max(heights) if heights else None
+        return max_width, max_height
+
+    def content_bounds(self) -> Optional[Tuple[int, int, int, int]]:
+        min_x: Optional[int] = None
+        min_y: Optional[int] = None
+        max_x: Optional[int] = None
+        max_y: Optional[int] = None
+
+        for segment in self.segments:
+            crop_x = segment.crop_x
+            crop_y = segment.crop_y
+            width = segment.content_width or segment.video_width
+            height = segment.content_height or segment.video_height
+            if crop_x is None or crop_y is None or width is None or height is None:
+                continue
+            if min_x is None or crop_x < min_x:
+                min_x = crop_x
+            if min_y is None or crop_y < min_y:
+                min_y = crop_y
+            candidate_max_x = crop_x + width
+            candidate_max_y = crop_y + height
+            if max_x is None or candidate_max_x > max_x:
+                max_x = candidate_max_x
+            if max_y is None or candidate_max_y > max_y:
+                max_y = candidate_max_y
+
+        if min_x is None or min_y is None or max_x is None or max_y is None:
+            return None
+        return (min_x, min_y, max_x, max_y)
+
+    def segment_path(self, segment: FullTimelapseSegment) -> Path:
+        return self._resolve_path(segment.path)
 
 
 __all__ = [

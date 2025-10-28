@@ -44,6 +44,16 @@ def count_frames(video_path: Path) -> int:
     return frames
 
 
+def get_video_size(video_path: Path) -> tuple[int, int]:
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    return width, height
+
+
 def build_backup(tmp_path: Path) -> TimelapseBackup:
     backup = TimelapseBackup.__new__(TimelapseBackup)
     backup.base_url = ""
@@ -142,6 +152,14 @@ def test_incremental_full_timelapse_appends_segments(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert len(manifest["segments"]) == 1
     assert manifest["segments"][0]["frame_count"] == 2
+    assert manifest["segments"][0]["video_width"] > 0
+    assert manifest["segments"][0]["video_height"] > 0
+
+    segment_files = list((slug_dir / "segments" / "full").glob("*.mp4"))
+    assert segment_files
+    seg_width, seg_height = get_video_size(segment_files[0])
+    assert seg_width == manifest["segments"][0]["video_width"]
+    assert seg_height == manifest["segments"][0]["video_height"]
 
     third_session = make_session_dir(backup.backup_dir, slug, start + timedelta(minutes=10))
     write_tile(third_session / "0_0.png", colors[2])
@@ -162,6 +180,17 @@ def test_incremental_full_timelapse_appends_segments(tmp_path):
     assert len(manifest["segments"]) == 2
     assert manifest["segments"][-1]["frame_count"] == 1
     assert manifest["segments"][-1]["last_session"] == (start + timedelta(minutes=10)).isoformat()
+    assert manifest["segments"][0]["video_width"] == manifest["segments"][1]["video_width"]
+    assert manifest["segments"][0]["video_height"] == manifest["segments"][1]["video_height"]
 
     assert count_frames(full_path) == 3
 
+    state = FullTimelapseState(slug_dir, "full.mp4", logger=logging.getLogger("timelapse-tests"))
+    state.load()
+    assert len(state.segments) == 2
+    dims = {(seg.video_width, seg.video_height) for seg in state.segments}
+    assert len(dims) == 1  # all segments share dimensions
+    assert state.segments[0].crop_x == state.segments[1].crop_x
+    assert state.segments[0].crop_y == state.segments[1].crop_y
+    assert state.segments[0].pad_left is not None
+    assert state.segments[1].pad_left is not None

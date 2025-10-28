@@ -40,3 +40,21 @@ steps:
     when:
       branch:
         - main
+
+  - name: trigger-portainer-stack-update
+    image: curlimages/curl:8.5.0
+    environment:
+      PORTAINER_WEBHOOK_URL:
+        from_secret: portainer_webhook_url
+    commands:
+      - |
+        if [ -z "$${PORTAINER_WEBHOOK_URL}" ]; then
+          echo "PORTAINER_WEBHOOK_URL secret not set" >&2
+          exit 1
+        fi
+        curl -fsS -X POST "$${PORTAINER_WEBHOOK_URL}"
+    depends_on:
+      - docker-build-and-push
+    when:
+      branch:
+        - main
