@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from timelapse_backup.models import CompositeFrame, FrameManifest
+from timelapse_backup.progress import eta_string
 from timelapse_backup.tiles import TileDownloader
 
 
@@ -89,6 +91,7 @@ class ManifestBuilder:
 
         progress_interval = max(1, total_sessions // 20)
         usable_sessions = 0
+        progress_start = perf_counter()
 
         for index, session_dir in enumerate(session_dirs, start=1):
             manifest = self.build_manifest_for_session(
@@ -104,8 +107,10 @@ class ManifestBuilder:
 
             if index % progress_interval == 0 or index == total_sessions:
                 percent = (index / total_sessions) * 100.0
+                elapsed = perf_counter() - progress_start
+                eta_text = eta_string(elapsed, index, total_sessions)
                 self.logger.info(
-                    "Frame preparation progress for '%s' (%s) %s %s: %s/%s sessions scanned, %s usable (%0.1f%%)",
+                    "Frame preparation progress for '%s' (%s) %s %s: %s/%s sessions scanned, %s usable (%0.1f%%, %s)",
                     timelapse_name,
                     slug,
                     mode_name,
@@ -114,6 +119,7 @@ class ManifestBuilder:
                     total_sessions,
                     usable_sessions,
                     percent,
+                    eta_text,
                 )
 
         return manifests

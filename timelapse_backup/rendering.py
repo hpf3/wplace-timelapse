@@ -8,6 +8,7 @@ import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Iterator, List, Optional, Sequence, Tuple
 
 import cv2
@@ -16,6 +17,7 @@ import numpy as np
 from timelapse_backup.config import DiffSettings
 from timelapse_backup.manifests import ManifestBuilder
 from timelapse_backup.models import CompositeFrame, FrameManifest, PreparedFrame
+from timelapse_backup.progress import eta_string
 from timelapse_backup.stats import TimelapseStatsCollector
 
 
@@ -61,6 +63,7 @@ class Renderer:
         total = len(manifests)
         progress_interval = max(1, total // 20)
         prepared: List[Optional[PreparedFrame]] = [None] * total
+        progress_start = perf_counter()
 
         with ThreadPoolExecutor(max_workers=self.frame_prep_workers) as executor:
             futures = [
@@ -81,8 +84,10 @@ class Renderer:
                 completed += 1
                 if completed % progress_interval == 0 or completed == total:
                     percent = (completed / total) * 100.0
+                    elapsed = perf_counter() - progress_start
+                    eta_text = eta_string(elapsed, completed, total)
                     self.logger.info(
-                        "Frame rendering progress for '%s' (%s) %s %s: %s/%s frames (%0.1f%%)",
+                        "Frame rendering progress for '%s' (%s) %s %s: %s/%s frames (%0.1f%%, %s)",
                         name,
                         slug,
                         mode_name,
@@ -90,6 +95,7 @@ class Renderer:
                         completed,
                         total,
                         percent,
+                        eta_text,
                     )
 
         return [frame for frame in prepared if frame and frame.temp_path is not None]
@@ -250,6 +256,7 @@ class Renderer:
 
         progress_interval = max(1, total_frames // 20)
         stats_collector = TimelapseStatsCollector(list(frame_datetimes))
+        progress_start = perf_counter()
 
         def generator() -> Iterator[bytes]:
             prev_composite_color: Optional[np.ndarray] = None
@@ -302,8 +309,10 @@ class Renderer:
                 frame_number = zero_based_index + 1
                 if frame_number % progress_interval == 0 or frame_number == total_frames:
                     percent = (frame_number / total_frames) * 100.0
+                    elapsed = perf_counter() - progress_start
+                    eta_text = eta_string(elapsed, frame_number, total_frames)
                     self.logger.info(
-                        "Encoding progress for '%s' (%s) %s %s: %s/%s frames (%0.1f%%)",
+                        "Encoding progress for '%s' (%s) %s %s: %s/%s frames (%0.1f%%, %s)",
                         name,
                         slug,
                         mode_name,
@@ -311,6 +320,7 @@ class Renderer:
                         frame_number,
                         total_frames,
                         percent,
+                        eta_text,
                     )
 
         return generator(), stats_collector
