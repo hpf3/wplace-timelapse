@@ -9,9 +9,10 @@ steps:
     image: python:3.13-slim
     environment:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_ROOT_USER_ACTION: ignore
     commands:
       - python -m pip install --upgrade pip
-      - pip install --no-cache-dir -r requirements.txt
+      - pip install --no-cache-dir -r requirements.txt pytest
       - pytest -q
 
   - name: docker-build-and-push
