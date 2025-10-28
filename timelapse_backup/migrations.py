@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -26,6 +27,9 @@ from timelapse_backup.sessions import (
 )
 
 LOGGER = logging.getLogger("timelapse.migrations")
+
+CROP_SAMPLE_COUNT_ENV = "TIMELAPSE_MIGRATION_CROP_SAMPLE_SESSIONS"
+DEFAULT_CROP_SAMPLE_COUNT = 1
 
 
 @dataclass
@@ -206,6 +210,38 @@ def _infer_crop_metadata(
         return crop_bounds, original_shape
 
 
+def _get_crop_sample_count() -> int:
+    """Return how many trailing sessions to sample when inferring crop metadata."""
+    raw_limit = os.getenv(CROP_SAMPLE_COUNT_ENV)
+    limit = DEFAULT_CROP_SAMPLE_COUNT
+    if raw_limit:
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            LOGGER.warning(
+                "Invalid %s value %r; falling back to default %s",
+                CROP_SAMPLE_COUNT_ENV,
+                raw_limit,
+                DEFAULT_CROP_SAMPLE_COUNT,
+            )
+    return max(0, limit)
+
+
+def _select_crop_sessions(session_dirs: List[Path]) -> List[Path]:
+    """Return the subset of session directories used for crop inference."""
+    sample_count = _get_crop_sample_count()
+    if sample_count == 0:
+        return []
+    if sample_count >= len(session_dirs):
+        return session_dirs
+    LOGGER.info(
+        "Sampling last %s session(s) out of %s for crop inference",
+        sample_count,
+        len(session_dirs),
+    )
+    return session_dirs[-sample_count:]
+
+
 def _prepare_segment_file(
     slug_dir: Path,
     output_filename: str,
@@ -305,10 +341,11 @@ def migrate_full_timelapse_segments(backup: TimelapseBackup) -> None:
             else:
                 frame_count = _estimate_frame_count(cutoff_session_dirs)
 
+            sample_session_dirs = _select_crop_sessions(cutoff_session_dirs)
             crop_info = _infer_crop_metadata(
                 backup,
                 timelapse,
-                cutoff_session_dirs,
+                sample_session_dirs,
                 mode_name,
             )
             if crop_info is not None:
@@ -317,6 +354,28 @@ def migrate_full_timelapse_segments(backup: TimelapseBackup) -> None:
                 content_width = max(0, crop_x1 - crop_x)
                 content_height = max(0, crop_y1 - crop_y)
             else:
+                if not sample_session_dirs:
+                    LOGGER.info(
+                        "Crop inference disabled for '%s' (%s) suffix '%s'; set %s to re-enable",
+                        name,
+                        slug,
+                        suffix,
+                        CROP_SAMPLE_COUNT_ENV,
+                    )
+                elif len(sample_session_dirs) < len(cutoff_session_dirs):
+                    LOGGER.info(
+                        "Crop inference failed using sampled sessions for '%s' (%s) suffix '%s'; falling back to full-frame defaults",
+                        name,
+                        slug,
+                        suffix,
+                    )
+                else:
+                    LOGGER.info(
+                        "Crop inference unavailable for '%s' (%s) suffix '%s'; falling back to full-frame defaults",
+                        name,
+                        slug,
+                        suffix,
+                    )
                 crop_x = crop_y = 0
                 original_shape = None
                 content_width = None
