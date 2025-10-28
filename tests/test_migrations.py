@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from timelapse_backup.full_timelapse import FullTimelapseState
 from timelapse_backup.migrations import migrate_full_timelapse_segments
 
 
@@ -47,11 +48,28 @@ def test_migration_creates_manifest_and_segment(tmp_path):
 
     start = datetime(2025, 1, 1, 0, 0, 0)
     mid = start + timedelta(minutes=5)
-    for ts in (start, mid):
-        _create_session(backup.backup_dir, slug, ts)
+    newer = mid + timedelta(minutes=5)
+    session_dirs = []
+    for ts in (start, mid, newer):
+        session_dirs.append(_create_session(backup.backup_dir, slug, ts))
 
     legacy_full = slug_dir / "full.mp4"
     _write_dummy_video(legacy_full)
+
+    stats_path = legacy_full.with_suffix(legacy_full.suffix + ".stats.txt")
+    stats_path.write_text(
+        "\n".join(
+            [
+                "Timelapse Report",
+                "Frame Overview",
+                "Frames rendered: 42",
+                "Timeline",
+                f"First frame: {start.isoformat()}",
+                f"Last frame: {mid.isoformat()}",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     migrate_full_timelapse_segments(backup)
 
@@ -65,7 +83,14 @@ def test_migration_creates_manifest_and_segment(tmp_path):
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["segments"][0]["path"].startswith("segments/full/")
-    assert manifest["segments"][0]["frame_count"] == 2
+    assert manifest["segments"][0]["frame_count"] == 42
+    assert manifest["segments"][0]["first_session"] == start.isoformat()
+    assert manifest["segments"][0]["last_session"] == mid.isoformat()
+
+    state = FullTimelapseState(slug_dir, "full.mp4", logger=logging.getLogger("timelapse-tests"))
+    state.load()
+    pending = state.pending_sessions(session_dirs)
+    assert pending == [session_dirs[-1]]
 
 
 def test_migration_is_idempotent(tmp_path):
@@ -78,6 +103,20 @@ def test_migration_is_idempotent(tmp_path):
     _create_session(backup.backup_dir, slug, start)
     legacy_full = slug_dir / "full.mp4"
     _write_dummy_video(legacy_full)
+
+    stats_path = legacy_full.with_suffix(legacy_full.suffix + ".stats.txt")
+    stats_path.write_text(
+        "\n".join(
+            [
+                "Frame Overview",
+                "Frames rendered: 10",
+                "Timeline",
+                f"First frame: {start.isoformat()}",
+                f"Last frame: {start.isoformat()}",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     migrate_full_timelapse_segments(backup)
     first_manifest = (slug_dir / "full.segments.json").read_text(encoding="utf-8")

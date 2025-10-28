@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import shutil
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
+
+import re
 
 from timelapse_backup.app import TimelapseBackup
 from timelapse_backup.full_timelapse import (
@@ -19,6 +22,13 @@ from timelapse_backup.sessions import (
 )
 
 LOGGER = logging.getLogger("timelapse.migrations")
+
+
+@dataclass
+class StatsCoverage:
+    first_session: Optional[datetime]
+    last_session: Optional[datetime]
+    frame_count: Optional[int]
 
 
 def _safe_iso(dt: datetime) -> str:
@@ -48,6 +58,67 @@ def _log_skip(
 
 def _estimate_frame_count(session_dirs: Iterable[Path]) -> int:
     return sum(1 for _ in session_dirs)
+
+
+def _parse_datetime(value: str) -> Optional[datetime]:
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "unknown":
+        return None
+    if stripped.endswith("Z"):
+        stripped = stripped[:-1]
+    try:
+        return datetime.fromisoformat(stripped)
+    except ValueError:
+        LOGGER.warning("Failed to parse datetime from stats.txt value: %s", value)
+        return None
+
+
+def _parse_int(value: str) -> Optional[int]:
+    digits = value.replace(",", "").strip()
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        LOGGER.warning("Failed to parse integer from stats.txt value: %s", value)
+        return None
+
+
+def _parse_stats_report(stats_path: Path) -> StatsCoverage:
+    first: Optional[datetime] = None
+    last: Optional[datetime] = None
+    frames: Optional[int] = None
+
+    first_pattern = re.compile(r"^First frame:\s*(.+)$")
+    last_pattern = re.compile(r"^Last frame:\s*(.+)$")
+    frames_pattern = re.compile(r"^Frames rendered:\s*([\d,]+)$")
+
+    try:
+        for raw_line in stats_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = first_pattern.match(line)
+            if match and first is None:
+                candidate = _parse_datetime(match.group(1))
+                if candidate is not None:
+                    first = candidate
+                continue
+            match = last_pattern.match(line)
+            if match and last is None:
+                candidate = _parse_datetime(match.group(1))
+                if candidate is not None:
+                    last = candidate
+                continue
+            match = frames_pattern.match(line)
+            if match and frames is None:
+                candidate = _parse_int(match.group(1))
+                if candidate is not None:
+                    frames = candidate
+    except OSError as exc:
+        LOGGER.warning("Failed to read stats report %s: %s", stats_path, exc)
+
+    return StatsCoverage(first_session=first, last_session=last, frame_count=frames)
 
 
 def _prepare_segment_file(
@@ -108,8 +179,18 @@ def migrate_full_timelapse_segments(backup: TimelapseBackup) -> None:
                 _log_skip(slug, mode_name, suffix, "no captured sessions available")
                 continue
 
+            stats_path = legacy_path.with_suffix(legacy_path.suffix + ".stats.txt")
+            stats_info = _parse_stats_report(stats_path) if stats_path.exists() else None
+
             first_dt = parse_session_datetime(session_dirs[0])
             last_dt = parse_session_datetime(session_dirs[-1])
+
+            if stats_info is not None:
+                if stats_info.first_session is not None:
+                    first_dt = stats_info.first_session
+                if stats_info.last_session is not None:
+                    last_dt = stats_info.last_session
+
             if first_dt is None or last_dt is None:
                 _log_skip(slug, mode_name, suffix, "unable to derive session timestamps")
                 continue
@@ -124,7 +205,10 @@ def migrate_full_timelapse_segments(backup: TimelapseBackup) -> None:
                 continue
 
             relative_segment_path = segment_path.relative_to(slug_dir)
-            frame_count = _estimate_frame_count(session_dirs)
+            if stats_info is not None and stats_info.frame_count is not None:
+                frame_count = stats_info.frame_count
+            else:
+                frame_count = _estimate_frame_count(session_dirs)
             segment = FullTimelapseSegment(
                 path=relative_segment_path.as_posix(),
                 first_session=_safe_iso(first_dt),
