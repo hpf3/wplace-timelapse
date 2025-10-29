@@ -7,11 +7,15 @@ import json
 import logging
 import shutil
 import tarfile
+import uuid
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Sequence, Optional
 
+import cv2
+import numpy as np
 from zoneinfo import ZoneInfo
 
 from historical_backfill.github_client import (
@@ -410,6 +414,10 @@ class CleanupManager:
         dry_run: bool = False,
         keep_archives: bool = False,
         release_limit: int = 1000,
+        *,
+        output_root: Path | None = None,
+        background_color: tuple[int, int, int] | None = None,
+        timelapse_quality: int = 23,
     ) -> None:
         self.backup_root = backup_root
         self.slug_configs = slug_configs
@@ -421,10 +429,21 @@ class CleanupManager:
         self.keep_archives = keep_archives
         self.release_limit = release_limit
         self.logger = LOGGER
+        self.output_root = output_root
+        self.background_color = background_color
+        self._background_color_array: Optional[np.ndarray]
+        if background_color is not None:
+            self._background_color_array = np.array(background_color, dtype=np.uint8)
+        else:
+            self._background_color_array = None
+        self._background_tolerance = 6
+        self.timelapse_quality = timelapse_quality
 
     def run(self, slugs: Sequence[str] | None = None) -> None:
         target_slugs = list(slugs) if slugs else list(self.slug_configs)
         all_gaps: list[GapInfo] = []
+
+        self._repair_output_videos(target_slugs)
 
         for slug in target_slugs:
             slug_config = self.slug_configs.get(slug)
@@ -622,6 +641,108 @@ class CleanupManager:
                     session_dir.rmdir()
             except OSError:
                 pass
+
+    def _repair_output_videos(self, slugs: Sequence[str]) -> None:
+        if self.output_root is None or self._background_color_array is None:
+            return
+        if shutil.which("ffmpeg") is None:
+            self.logger.debug("ffmpeg not available; skipping output repair")
+            return
+
+        for slug in slugs:
+            output_dir = self.output_root / slug
+            if not output_dir.exists():
+                continue
+            for video_path in sorted(output_dir.rglob("*.mp4")):
+                if not video_path.is_file():
+                    continue
+                try:
+                    needs_trim = self._first_frame_is_background(video_path)
+                except Exception:  # pragma: no cover - defensive
+                    self.logger.debug("Failed to inspect %s", video_path, exc_info=True)
+                    continue
+                if not needs_trim:
+                    continue
+                if self.dry_run:
+                    self.logger.info("Dry run: would drop first frame from %s", video_path)
+                    continue
+                self.logger.info("Dropping solid background frame from %s", video_path)
+                if not self._trim_first_frame(video_path):
+                    self.logger.warning("Failed to drop first frame from %s", video_path)
+
+    def _first_frame_is_background(self, video_path: Path) -> bool:
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            capture.release()
+            return False
+        try:
+            ok, frame = capture.read()
+        finally:
+            capture.release()
+        if not ok or frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            return False
+        if self._background_color_array is None:
+            return False
+        background = self._background_color_array.astype(np.int16)
+        diff = np.abs(frame.astype(np.int16) - background.reshape(1, 1, 3))
+        max_diff = int(diff.max())
+        return max_diff <= self._background_tolerance
+
+    def _trim_first_frame(self, video_path: Path) -> bool:
+        temp_path = video_path.with_name(f".tmp_trim_{uuid.uuid4().hex}{video_path.suffix}")
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+        codec_args = [
+            "-c:v",
+            "libx264",
+            "-crf",
+            str(self.timelapse_quality),
+            "-preset",
+            "slow",
+            "-tune",
+            "animation",
+            "-x264-params",
+            "keyint=300:min-keyint=300:scenecut=0",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vf",
+            "trim=start_frame=1,setpts=PTS-STARTPTS",
+            "-an",
+            *codec_args,
+            str(temp_path),
+        ]
+
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0 or not temp_path.exists():
+            self.logger.error(
+                "ffmpeg failed to trim %s: %s",
+                video_path,
+                result.stderr.decode("utf-8", errors="ignore") if result.stderr else result.returncode,
+            )
+            temp_path.unlink(missing_ok=True)
+            return False
+
+        try:
+            temp_path.replace(video_path)
+        except OSError as exc:
+            self.logger.error("Failed to replace %s with trimmed video: %s", video_path, exc)
+            temp_path.unlink(missing_ok=True)
+            return False
+
+        return True
 
 
 __all__ = [

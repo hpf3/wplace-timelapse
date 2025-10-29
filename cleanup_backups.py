@@ -8,6 +8,8 @@ import logging
 from datetime import timedelta
 from pathlib import Path
 
+# type: ignore[reportPrivateImportUsage]
+from timelapse_backup.config import _parse_background_color
 from timelapse_backup.cleanup import (
     CleanupManager,
     collect_slug_configs,
@@ -98,6 +100,17 @@ def resolve_backup_root(config: dict, override: Path | None, config_path: Path) 
     return root
 
 
+def resolve_output_root(config: dict, config_path: Path) -> Path | None:
+    settings = config.get("global_settings", {})
+    output_dir = settings.get("output_dir")
+    if output_dir is None:
+        return None
+    root = Path(output_dir)
+    if not root.is_absolute():
+        root = (config_path.parent / root).resolve()
+    return root
+
+
 def resolve_interval(config: dict, override: float | None) -> timedelta:
     if override is not None:
         minutes = override
@@ -127,10 +140,14 @@ def main() -> None:
         parser.error("No slugs found in configuration; nothing to process")
 
     backup_root = resolve_backup_root(config, args.backup_root, config_path)
+    output_root = resolve_output_root(config, config_path)
     interval = resolve_interval(config, args.interval_minutes)
     min_gap = timedelta(hours=args.min_gap_hours)
     timezone_info = determine_timezone(args.timezone)
     cache_paths = ensure_cache_paths(args.cache_root)
+    global_settings = config.get("global_settings", {})
+    background_color = _parse_background_color(global_settings.get("background_color"))
+    quality = int(global_settings.get("timelapse_quality", 23))
 
     manager = CleanupManager(
         backup_root=backup_root,
@@ -142,6 +159,9 @@ def main() -> None:
         dry_run=args.dry_run,
         keep_archives=args.keep_archives,
         release_limit=args.release_limit,
+        output_root=output_root,
+        background_color=background_color,
+        timelapse_quality=quality,
     )
 
     manager.run(args.slugs)

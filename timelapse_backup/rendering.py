@@ -257,6 +257,7 @@ class Renderer:
         progress_interval = max(1, total_frames // 20)
         stats_collector = TimelapseStatsCollector(list(frame_datetimes))
         progress_start = perf_counter()
+        background_color = np.array(self.manifest_builder.background_color, dtype=np.uint8)
 
         def generator() -> Iterator[bytes]:
             prev_composite_color: Optional[np.ndarray] = None
@@ -289,6 +290,17 @@ class Renderer:
                         composite_color,
                         return_stats=True,
                     )
+                    if np.all(frame == background_color):
+                        prev_composite_color = composite_color
+                        self.logger.debug(
+                            "Skipping solid background diff frame for '%s' (%s) %s %s at index %s",
+                            name,
+                            slug,
+                            mode_name,
+                            label,
+                            zero_based_index,
+                        )
+                        continue
                     prev_composite_color = composite_color
                     success, buffer = cv2.imencode(".png", frame)
                     if not success:

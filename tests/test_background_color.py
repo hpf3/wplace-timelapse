@@ -1,4 +1,6 @@
+import logging
 import sys
+import types
 from pathlib import Path
 
 import cv2
@@ -9,6 +11,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from timelapse_backup import TimelapseBackup
+from timelapse_backup.models import PreparedFrame
+from timelapse_backup.rendering import Renderer
 
 
 def make_backup(**kwargs) -> TimelapseBackup:
@@ -91,3 +95,47 @@ def test_composite_preserves_background_for_transparent_tiles(tmp_path):
     unique_pixels = {tuple(map(int, pixel)) for pixel in composite.color.reshape(-1, 3)}
     assert unique_pixels == {backing_color}
     assert np.count_nonzero(composite.alpha) == 0
+
+
+def test_diff_generator_skips_solid_background_frame(tmp_path):
+    backing_color = (190, 150, 37)
+    first_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    second_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    second_frame[0, 0] = [255, 255, 255]
+
+    first_path = tmp_path / "frame_000000.png"
+    second_path = tmp_path / "frame_000001.png"
+    cv2.imwrite(str(first_path), first_frame)
+    cv2.imwrite(str(second_path), second_frame)
+
+    manifest_builder = types.SimpleNamespace(background_color=backing_color)
+    diff_settings = types.SimpleNamespace(
+        threshold=10,
+        visualization="overlay",
+        enhancement_factor=1.0,
+    )
+    renderer = Renderer(
+        manifest_builder,
+        logger=logging.getLogger("timelapse-test"),
+        frame_prep_workers=1,
+        auto_crop_transparent_frames=True,
+        diff_settings=diff_settings,
+    )
+
+    prepared_frames = [
+        PreparedFrame(index=0, session_dir=tmp_path, temp_path=first_path, frame_shape=(4, 4), alpha_bounds=None),
+        PreparedFrame(index=1, session_dir=tmp_path, temp_path=second_path, frame_shape=(4, 4), alpha_bounds=None),
+    ]
+    frame_iter, stats = renderer.frame_byte_generator(
+        prepared_frames,
+        "diff",
+        "slug",
+        "name",
+        "label",
+        [None, None],
+    )
+
+    encoded = list(frame_iter)
+
+    assert len(encoded) == 1
+    assert len(stats.records) == 1
