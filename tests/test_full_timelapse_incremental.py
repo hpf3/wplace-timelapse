@@ -1,6 +1,8 @@
 import json
 import logging
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -44,6 +46,23 @@ def count_frames(video_path: Path) -> int:
     return frames
 
 
+def wait_for_stats_completion(backup: TimelapseBackup, timeout: float = 5.0):
+    deadline = time.time() + timeout
+    last_snapshot = []
+    while time.time() < deadline:
+        jobs = backup.list_stats_jobs()
+        if jobs:
+            last_snapshot = jobs
+            if all(job.status in {"completed", "failed"} for job in jobs):
+                for job in jobs:
+                    thread = getattr(job, "thread", None)
+                    if thread is not None and thread.is_alive():
+                        thread.join(timeout=0.1)
+                return jobs
+        time.sleep(0.05)
+    raise AssertionError(f"Stats generation did not complete; last snapshot: {last_snapshot}")
+
+
 def get_video_size(video_path: Path) -> tuple[int, int]:
     capture = cv2.VideoCapture(str(video_path))
     try:
@@ -65,6 +84,7 @@ def build_backup(tmp_path: Path) -> TimelapseBackup:
     backup.output_dir.mkdir()
     backup.backup_dir = tmp_path / "backups"
     backup.backup_dir.mkdir()
+    backup.backup_interval = 5
     backup.logger = logging.getLogger("timelapse-tests")
     backup.frame_prep_workers = 1
     backup.request_delay = 0.0
@@ -75,6 +95,9 @@ def build_backup(tmp_path: Path) -> TimelapseBackup:
     backup.reporting_enabled = False
     backup.seconds_per_pixel = 30
     backup.coverage_gap_multiplier = None
+    backup._stats_jobs = {}
+    backup._stats_job_index = {}
+    backup._stats_jobs_lock = threading.Lock()
     return backup
 
 
@@ -194,3 +217,53 @@ def test_incremental_full_timelapse_appends_segments(tmp_path):
     assert state.segments[0].crop_y == state.segments[1].crop_y
     assert state.segments[0].pad_left is not None
     assert state.segments[1].pad_left is not None
+
+
+def test_full_timelapse_stats_job_generates_report(tmp_path):
+    backup = build_backup(tmp_path)
+    backup.reporting_enabled = True
+
+    slug = "canvas"
+    timelapse_config = {
+        "coordinates": {"xmin": 0, "xmax": 0, "ymin": 0, "ymax": 0},
+        "name": "Canvas",
+    }
+
+    start = datetime(2025, 1, 1, 0, 0, 0)
+    session_dirs = []
+    colors = [
+        (255, 0, 0, 255),
+        (0, 255, 0, 255),
+        (0, 0, 255, 255),
+    ]
+
+    for index, color in enumerate(colors):
+        session_dir = make_session_dir(
+            backup.backup_dir,
+            slug,
+            start + timedelta(minutes=5 * index),
+        )
+        write_tile(session_dir / "0_0.png", color)
+        session_dirs.append(session_dir)
+
+    backup.render_incremental_full_timelapse(
+        slug=slug,
+        name="Canvas",
+        timelapse_config=timelapse_config,
+        session_dirs=session_dirs,
+        mode_name="normal",
+        suffix="",
+        output_filename="full.mp4",
+        label="validation",
+    )
+
+    jobs = wait_for_stats_completion(backup)
+    assert jobs, "Expected at least one stats generation job"
+    assert all(job.status == "completed" for job in jobs)
+
+    stats_path = backup.output_dir / slug / "full.mp4.stats.txt"
+    assert stats_path.exists(), "Full timelapse stats report was not generated"
+
+    report = stats_path.read_text(encoding="utf-8")
+    assert "Frames rendered: 3" in report
+    assert "Timelapse: Canvas (canvas)" in report

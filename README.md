@@ -1,128 +1,141 @@
 # WPlace Timelapse System
 
-A Python-based automated system that creates timelapse videos from [WPlace](https://wplace.live) collaborative pixel art canvas. The system downloads tile images at regular intervals and generates daily timelapses showing the evolution of artwork in different geographical regions.
+WPlace Timelapse System downloads tiles from the [WPlace](https://wplace.live) collaborative canvas, archives them efficiently, and renders daily MP4 timelapses. Everything you need to run the collector, renderer, and helper tooling lives in this repository.
 
-## Features
+## What It Does
 
-- **Multi-Location Monitoring**: Track multiple regions simultaneously (Toulouse, Buenos Aires, etc.)
-- **Automated Collection**: Downloads tiles every 5 minutes with configurable intervals
-- **Dual Timelapse Modes**:
-  - **Normal Mode**: Standard timelapse showing full canvas evolution
-  - **Differential Mode**: Highlights only the changes between frames
-- **Flexible Configuration**: JSON-based configuration for easy setup of new regions
-- **Robust Error Handling**: Continues operation despite network issues or missing tiles
-- **Smart Scheduling**: Uses APScheduler for reliable automated execution
-- **Video Output**: High-quality MP4 videos with configurable FPS and quality
+- Captures tiles on a fixed schedule and stores them in timestamped session folders.
+- Skips duplicate tiles by creating lightweight placeholders, keeping long-running archives manageable.
+- Renders normal composites, optional differential videos, and coverage statistics from the collected sessions.
+- Auto-crops transparent borders, applies tunable quality settings, and exposes programmatic hooks for custom automation.
 
-## Sample Output
+## Default Paths
 
-### Normal Timelapse
-![Toulouse](images/toulouse_normal.png)
-*Toulouse region timelapse showing collaborative pixel art evolution*
+The collector is designed to run inside a container that exposes `/data` volumes:
 
-### Normal vs Differential Comparison
-| Normal Mode | Differential Mode |
-|-------------|-------------------|
-| ![Toulouse Normal](images/toulouse_normal.png) | ![Toulouse Diff](images/toulouse_diff.png) |
-| *Full canvas view* | *Changes highlighted in green* |
+- Backups: `/data/backups`
+- Output videos: `/data/output`
+- Logs: `/data/logs/timelapse_backup.log`
+- Cache / temp data: `/data/cache` (used when retrieving archive/historical data)
 
-## How It Works
-
-1. **Tile Collection**: Downloads PNG tiles from WPlace's tile server at specified coordinates
-2. **Image Composition**: Combines individual tiles into complete canvas images
-3. **Video Generation**: Creates MP4 timelapses using OpenCV with proper frame sequencing
-4. **Differential Analysis**: Detects and visualizes changes between consecutive frames
-5. **Automated Scheduling**: Runs backups every 5 minutes and creates daily videos at midnight
+If those directories are missing the logger falls back to the working directory, but creating `/data` up front keeps everything consistent.
 
 ## Quick Start
 
-### Prerequisites
+### Local Python environment
 
-- Python 3.13 or higher
-- pip or uv package manager
-
-### Installation
-
-1. **Clone the repository**:
+1. Clone the repository and enter it:
    ```bash
    git clone https://github.com/yourusername/wplace-timelapse.git
    cd wplace-timelapse
    ```
-
-2. **Install dependencies**:
+2. Install dependencies:
    ```bash
-   # Using uv (recommended)
-   uv install
-
-   # Or using pip with virtual environment
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
+   uv sync  # or: python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
    ```
-
-3. **Configure your timelapses**:
+3. Create a configuration:
    ```bash
    cp config.example.json config.json
-   # Edit config.json with your desired regions
+   # Adjust coordinates or turn on extra regions as needed.
    ```
-
-4. **Run the system**:
+4. Run the scheduler:
    ```bash
    python main.py
    ```
-   The `main.py` entry point now delegates to the packaged facade so it stays
-   tiny and easy to reason about. Import `TimelapseBackup` from
-   `timelapse_backup` if you want to orchestrate backups from your own code.
+5. Watch the outputs:
+   - Raw frames and placeholders land in `backups/<slug>/<date>/<time>/`.
+   - Videos appear under `output/<slug>/YYYY-MM-DD[_suffix].mp4`.
+   - Logs flow to `/data/logs/timelapse_backup.log` when available (otherwise `./timelapse_backup.log`).
 
-### Programmatic use
+Programmatic control stays straightforward:
 
 ```python
 from timelapse_backup import TimelapseBackup
 
 backup = TimelapseBackup()
-backup.create_daily_timelapse()
+backup.create_full_timelapses()
 ```
 
-## Code Structure
+### Docker
 
-The refactored project centers around the `timelapse_backup` package:
+You can use the prebuilt image published from this repository:
 
-- `timelapse_backup.app` — houses the `TimelapseBackup` facade that wires all collaborators together.
-- `timelapse_backup.config` — dataclasses, validation, and JSON/.env loading utilities.
-- `timelapse_backup.logging_setup` — shared logging configuration helpers.
-- `timelapse_backup.sessions` — filesystem discovery helpers for session folders.
-- `timelapse_backup.tiles` — tile download logic and placeholder management.
-- `timelapse_backup.manifests` — manifest assembly and composite frame creation.
-- `timelapse_backup.rendering` — frame preparation, differential rendering, and FFmpeg streaming.
-- `timelapse_backup.stats` — statistics aggregation and human-readable report generation.
-- `timelapse_backup.scheduler` — APScheduler orchestration of recurring jobs.
+```bash
+docker pull ghcr.io/hpf3/wplace-timelapse:latest
+```
 
-The lightweight `main.py` script simply imports the facade and calls `run()`,
-preserving the legacy command for existing automation while encouraging library usage.
+1. Prepare host directories so data persists:
+   ```bash
+   mkdir -p ./data/backups ./data/output ./data/logs ./data/cache
+   cp config.example.json ./data/config.json  # edit as needed
+   ```
+2. Run the container:
+   ```bash
+   docker run -it -v "$(pwd)/data:/data" ghcr.io/hpf3/wplace-timelapse:latest
+   ```
+   The entrypoint copies `/data/config.json` into place, runs migrations, starts the background cleanup helper, and launches the scheduler.
+3. Review outputs under `./data` on the host; logs stream to `./data/logs/timelapse_backup.log`.
 
-For detailed installation instructions, see [INSTALL.md](INSTALL.md).
+Prefer to build locally? Swap step 0 for:
 
-## Configuration
+```bash
+docker build -t wplace-timelapse -f images/WplaceRecorder/Dockerfile .
+```
+and use that tag in step 2.
 
-The system uses `config.json` for configuration. Here's the structure:
+## Configuration Basics
+
+`config.json` maps directly to the dataclasses in `timelapse_backup.config`. The example file in the repository looks like this:
 
 ```json
 {
   "timelapses": [
     {
-      "slug": "toulouse",
-      "name": "Toulouse",
-      "description": "Toulouse region monitoring",
+      "slug": "example_region",
+      "name": "Example Region",
+      "description": "Example timelapse configuration for a small region",
       "coordinates": {
-        "xmin": 1031,
-        "xmax": 1032,
-        "ymin": 747,
-        "ymax": 748
+        "xmin": 1000,
+        "xmax": 1002,
+        "ymin": 800,
+        "ymax": 802
       },
       "enabled": true,
       "timelapse_modes": {
-        "normal": {"enabled": true, "suffix": ""},
-        "diff": {"enabled": true, "suffix": "_diff"}
+        "normal": {
+          "enabled": true,
+          "suffix": "",
+          "create_full_timelapse": true
+        },
+        "diff": {
+          "enabled": true,
+          "suffix": "_diff",
+          "create_full_timelapse": false
+        }
+      }
+    },
+    {
+      "slug": "larger_area",
+      "name": "Larger Area Example",
+      "description": "Example configuration for monitoring a larger region",
+      "coordinates": {
+        "xmin": 1200,
+        "xmax": 1210,
+        "ymin": 850,
+        "ymax": 860
+      },
+      "enabled": false,
+      "timelapse_modes": {
+        "normal": {
+          "enabled": true,
+          "suffix": "",
+          "create_full_timelapse": false
+        },
+        "diff": {
+          "enabled": false,
+          "suffix": "_diff",
+          "create_full_timelapse": false
+        }
       }
     }
   ],
@@ -135,6 +148,7 @@ The system uses `config.json` for configuration. Here's the structure:
     "timelapse_fps": 10,
     "timelapse_quality": 23,
     "background_color": [0, 0, 0],
+    "auto_crop_transparent_frames": true,
     "diff_settings": {
       "threshold": 10,
       "visualization": "colored",
@@ -145,137 +159,52 @@ The system uses `config.json` for configuration. Here's the structure:
 }
 ```
 
-### Key Configuration Options
+Key notes:
 
-- **coordinates**: Define the tile region to monitor (x/y tile coordinates)
-- **backup_interval_minutes**: How often to download tiles (default: 5 minutes)
-- **timelapse_fps**: Frames per second for output videos (default: 10)
-- **background_color**: Base color (RGB array, hex string, or `{"value": [...], "order": "bgr"}`) used to fill empty areas or missing tiles (default: `[0, 0, 0]`)
-- **auto_crop_transparent_frames**: When enabled (default: `true`), unions the non-transparent pixels from all merged frames and crops timelapse videos to that bounding box so unused tile borders are removed.
-- **diff_settings**: Controls differential timelapse appearance and sensitivity
+- Coordinates are inclusive tile bounds. `larger_area` is disabled by default but demonstrates how to monitor a broader region.
+- `auto_crop_transparent_frames` trims unused borders after compositing so videos stay focused on the artwork. (Primarily useful when most tiles are empty.)
+- Differential settings control whether change-only renders are produced. Stats reports only include meaningful change metrics when at least one diff-capable render runs; the `overlay` mode is a good compromise if you want a conventional video plus change counts.
+- Environment variables in `.env` can override many settings thanks to `python-dotenv`.
 
-Numeric arrays are interpreted as `[R, G, B]` for readability. Use a hex string (for example `"#2596BE"`) or wrap values as `{"value": [B, G, R], "order": "bgr"}` if you need to specify explicit BGR ordering.
+## Repository Layout
 
-## Output Structure
-
-```
-output/
-├── toulouse/
-│   ├── 2025-09-01.mp4      # Normal timelapse
-│   ├── 2025-09-01_diff.mp4 # Differential timelapse
-│   └── 2025-09-02.mp4
-├── other/
-│   └── ...
-└── ...
-
-backups/
-├── toulouse/
-│   └── 2025-09-01/
-│       ├── 12-00-00/       # Hour-minute-second
-│       │   ├── 1214_832.png
-│       │   └── ...
-│       └── ...
-└── ...
-```
+- `timelapse_backup/` — scheduler, rendering, manifests, stats, and logging helpers.
+- `tests/` — property-based and integration coverage for download, cleanup, diffing, and reporting routines.
+- `historical_backfill/` — CLI for importing archived snapshots before the live collector started.
+- `images/` — container build context that mirrors the `/data` layout used in production.
 
 ## Historical Backfill
 
-The `historical_backfill/` sub-project can pre-populate the `backups/` tree with
-frames that predate live capture by reusing snapshots from
-[`murolem/wplace-archives`](https://github.com/murolem/wplace-archives). The CLI
-mirrors the timelapse layout so the main pipeline can consume the backfilled
-sessions without further changes.
+Use the CLI to populate `backups/` with archived frames:
 
 ```bash
-# Prepare the workspace
-python3 -m historical_backfill init
-
-# Inspect the latest archive releases and fetch one
-python3 -m historical_backfill download --list --count 5
-python3 -m historical_backfill download --tag world-2025-10-20T03-30-04.354Z
-
-# Optional checklist for manual download/extraction steps
-python3 -m historical_backfill plan --slug toulouse
-
-# Generate synthetic captures every 5 minutes between two timestamps
-python3 -m historical_backfill generate \
-  --slug toulouse \
+python -m historical_backfill init
+python -m historical_backfill download --list --count 5
+python -m historical_backfill download --tag world-2025-10-20T03-30-04.354Z
+python -m historical_backfill generate \
+  --slug example_region_historical \
   --start 2025-10-19T18:30:00Z \
   --end 2025-10-20T03:30:00Z \
   --interval-minutes 5 \
   --config config.json \
-  --config-slug toulouse \
+  --config-slug example_region \
   --cleanup-archives
-
-# Dedicated Nemo helper (downloads, extracts, generates in one pass)
-bash historical_backfill/fetch_nemo_history.sh
-# Defaults target `/data/backups` for frames and `/data/cache` for temporary
-# archive storage; set the `HF_*` env vars described in the script to adjust.
 ```
 
-Releases are mapped to frame timestamps by their capture time (encoded in the
-folder name). Provide a `GITHUB_TOKEN` environment variable if you hit GitHub
-rate limits while listing or downloading archives. When multiple frames reuse
-the same archive snapshot,
-placeholders are created to match the behaviour of the live collector.
-Add `--cleanup-archives` to the generate command to remove the multi-gigabyte
-tar parts after they are consumed (pair with `--archives-dir` if you store the
-downloads elsewhere).
+`historical_backfill/fetch_nemo_history.sh` automates the download/extract/generate loop with sensible `/data` defaults. The archives come from [murolem/wplace-archives](https://github.com/murolem/wplace-archives); huge thanks to that project for keeping historical canvases available.
+
+⚠️ Expect heavy bandwidth usage: each global archive is roughly 6–8 GB and must be fully downloaded regardless of the actually needed area, so generating multiple frames quickly adds up.
 
 ## Finding Coordinates
 
-To monitor a specific region on WPlace:
-
-1. Visit [wplace.live](https://wplace.live)
-2. Navigate to your area of interest
-3. Check the browser's developer tools Network tab for tile requests
-4. Look for URLs like `https://backend.wplace.live/files/s0/tiles/X/Y.png`
-5. Use those X,Y coordinates to define your region bounds
-
-## Timelapse Modes
-
-### Normal Mode
-Standard timelapse showing the complete evolution of the canvas region.
-
-### Differential Mode
-Advanced mode that highlights only the pixels that changed between frames:
-- **Colored**: Shows changes in bright green
-- **Binary**: Black and white change detection
-- **Heatmap**: Color-coded intensity of changes
-- **Overlay**: Changes highlighted on semi-transparent background
-
-## Technical Details
-
-- **Tile System**: WPlace uses a tile-based system similar to web maps
-- **Image Format**: Downloads PNG tiles and combines them into composite images
-- **Video Codec**: Outputs MP4 using OpenCV's mp4v codec
-- **Scheduling**: APScheduler handles automated execution with cron-like triggers
-- **Error Recovery**: Continues operation even if individual tiles fail to download
-
-## Example Regions
-
-The default configuration includes three interesting regions:
-
-- **Toulouse**: European city with moderate activity  
-- **Buenos Aires**: South American region with varied artwork
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+1. Open [wplace.live](https://wplace.live) and move to the region you want to capture.
+2. Click the pixel that represents the top-left corner of your area. The info strip at the bottom shows the tile coordinates as the first two numbers (X, Y); record them as `xmin` and `ymin`.
+3. Click the bottom-right pixel of the area and record the first two numbers as `xmax` and `ymax`.
+4. Paste those inclusive bounds into `config.json`. For large canvases, split the region into multiple configs if you want separate renders or different mode settings.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [WPlace](https://wplace.live) for providing the collaborative pixel art platform
-- OpenCV team for the excellent computer vision library
-- APScheduler developers for robust job scheduling
+MIT — see [LICENSE](LICENSE).
 
 ## Support
 

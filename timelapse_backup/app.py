@@ -13,7 +13,8 @@ import subprocess
 import uuid
 import threading
 import tempfile
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Iterable, Iterator, Union
 from dotenv import load_dotenv
@@ -52,6 +53,25 @@ from timelapse_backup import scheduler as scheduler_module
 # Load environment variables
 load_dotenv()
 
+
+@dataclass
+class StatsGenerationJob:
+    job_id: str
+    slug: str
+    mode_name: str
+    suffix: str
+    output_filename: str
+    timelapse_config: Dict[str, Any]
+    start: Optional[datetime]
+    end: Optional[datetime]
+    label: str
+    status: str = "pending"
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error: Optional[str] = None
+    thread: Optional[threading.Thread] = field(default=None, repr=False)
+
+
 class TimelapseBackup:
     PLACEHOLDER_SUFFIX = '.placeholder'
 
@@ -78,6 +98,11 @@ class TimelapseBackup:
         # Create directories
         self.backup_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
+
+        # Stats job tracking
+        self._stats_jobs: Dict[str, StatsGenerationJob] = {}
+        self._stats_job_index: Dict[Tuple[str, str], str] = {}
+        self._stats_jobs_lock = threading.Lock()
 
     def _apply_global_settings(self, settings: GlobalSettings) -> None:
         """Populate instance attributes from parsed global settings."""
@@ -836,6 +861,264 @@ class TimelapseBackup:
             frame_datetimes,
         )
 
+    def _find_timelapse_entry(self, slug: str) -> Optional[Dict[str, Any]]:
+        for timelapse in self.config.get("timelapses", []):
+            if timelapse.get("slug") == slug:
+                return timelapse
+        return None
+
+    def _sessions_between(
+        self,
+        slug: str,
+        start: Optional[datetime],
+        end: Optional[datetime],
+    ) -> List[Path]:
+        all_sessions = get_all_sessions(self.backup_dir, slug)
+        selected: List[Path] = []
+        for session_dir in all_sessions:
+            session_dt = parse_session_datetime(session_dir)
+            if session_dt is None:
+                continue
+            if start is not None and session_dt < start:
+                continue
+            if end is not None and session_dt > end:
+                continue
+            selected.append(session_dir)
+        return selected
+
+    def _collect_stats_for_sessions(
+        self,
+        slug: str,
+        name: str,
+        timelapse_config: Dict[str, Any],
+        session_dirs: List[Path],
+        mode_name: str,
+        label: str,
+    ) -> Optional[TimelapseStatsCollector]:
+        coordinates = self.get_tile_coordinates(timelapse_config)
+        if not coordinates:
+            self.logger.warning(
+                "Unable to collect stats for '%s' (%s) %s %s; no coordinates defined",
+                name,
+                slug,
+                mode_name,
+                label,
+            )
+            return None
+
+        manifests = self._build_frame_manifests(
+            session_dirs,
+            timelapse_config,
+            coordinates,
+            slug,
+            name,
+            mode_name,
+            label,
+        )
+        if not manifests:
+            self.logger.warning(
+                "Unable to collect stats for '%s' (%s) %s %s; no frame manifests generated",
+                name,
+                slug,
+                mode_name,
+                label,
+            )
+            return None
+
+        frame_datetimes = [
+            parse_session_datetime(manifest.session_dir)
+            for manifest in manifests
+        ]
+        renderer = self._get_renderer()
+        return renderer.collect_stats_from_manifests(
+            manifests,
+            coordinates,
+            mode_name,
+            slug,
+            name,
+            label,
+            frame_datetimes,
+        )
+
+    def _execute_stats_job(self, job: StatsGenerationJob) -> None:
+        timelapse_config = job.timelapse_config
+        name = timelapse_config.get("name") or job.slug
+
+        session_dirs = self._sessions_between(job.slug, job.start, job.end)
+        if not session_dirs:
+            self.logger.info(
+                "Stats generation job %s skipped; no sessions found between %s and %s",
+                job.job_id,
+                job.start,
+                job.end,
+            )
+            return
+
+        stats_collector = self._collect_stats_for_sessions(
+            job.slug,
+            name,
+            timelapse_config,
+            session_dirs,
+            job.mode_name,
+            job.label,
+        )
+        if stats_collector is None:
+            self.logger.info(
+                "Stats generation job %s produced no data for '%s' (%s)",
+                job.job_id,
+                name,
+                job.slug,
+            )
+            return
+
+        gap_threshold: Optional[timedelta] = None
+        gap_multiplier = getattr(self, "coverage_gap_multiplier", None)
+        if (
+            gap_multiplier is not None
+            and gap_multiplier > 0
+            and getattr(self, "backup_interval", 0) > 0
+        ):
+            gap_threshold = timedelta(
+                minutes=self.backup_interval * gap_multiplier
+            )
+
+        stats_summary = stats_collector.summarize(
+            gap_threshold,
+            seconds_per_pixel=getattr(self, "seconds_per_pixel", 30),
+        )
+
+        slug_dir = self.output_dir / job.slug
+        slug_dir.mkdir(exist_ok=True)
+        target_video = slug_dir / job.output_filename
+        report_path = target_video.with_suffix(target_video.suffix + ".stats.txt")
+
+        generated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        report_text = build_stats_report(
+            slug=job.slug,
+            name=name,
+            mode=job.mode_name,
+            label=job.label,
+            output_path=target_video,
+            generated_at=generated_at,
+            stats=stats_summary,
+        )
+        report_path.write_text(report_text, encoding="utf-8")
+
+        rendered_frames = stats_summary.get("rendered_frames", 0)
+        start_ts = stats_summary.get("start_timestamp")
+        end_ts = stats_summary.get("end_timestamp")
+        self.logger.info(
+            "Stats generation job %s completed for '%s' (%s) %s; %s frames (%s -> %s)",
+            job.job_id,
+            name,
+            job.slug,
+            job.mode_name,
+            rendered_frames,
+            start_ts or "unknown",
+            end_ts or "unknown",
+        )
+
+    def _run_stats_job(self, job_id: str) -> None:
+        with self._stats_jobs_lock:
+            job = self._stats_jobs.get(job_id)
+            if job is None:
+                return
+            job.status = "running"
+            job.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        try:
+            self._execute_stats_job(job)
+        except Exception as exc:
+            self.logger.exception(
+                "Stats generation job %s failed: %s",
+                job_id,
+                exc,
+            )
+            with self._stats_jobs_lock:
+                job.error = str(exc)
+                job.status = "failed"
+                job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            return
+
+        with self._stats_jobs_lock:
+            job.status = "completed"
+            job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def schedule_stats_generation(
+        self,
+        slug: str,
+        mode_name: str,
+        suffix: str,
+        output_filename: str,
+        *,
+        timelapse_config: Optional[Dict[str, Any]] = None,
+        start: Optional[datetime],
+        end: Optional[datetime],
+        label: str,
+    ) -> Optional[str]:
+        if not getattr(self, "reporting_enabled", False):
+            self.logger.debug(
+                "Skipping stats generation for '%s' (%s); reporting disabled",
+                slug,
+                mode_name,
+            )
+            return None
+
+        resolved_config = timelapse_config or self._find_timelapse_entry(slug)
+        if resolved_config is None:
+            self.logger.warning(
+                "Skipping stats generation for '%s' (%s); configuration not found",
+                slug,
+                mode_name,
+            )
+            return None
+
+        job_key = (slug, output_filename)
+        with self._stats_jobs_lock:
+            existing_id = self._stats_job_index.get(job_key)
+            if existing_id is not None:
+                existing_job = self._stats_jobs.get(existing_id)
+                if existing_job and existing_job.status in {"pending", "running"}:
+                    self.logger.info(
+                        "Stats generation already in progress for '%s' (%s); using job %s",
+                        slug,
+                        mode_name,
+                        existing_id,
+                    )
+                    return existing_id
+
+        job_id = uuid.uuid4().hex
+        job = StatsGenerationJob(
+            job_id=job_id,
+            slug=slug,
+            mode_name=mode_name,
+            suffix=suffix,
+            output_filename=output_filename,
+            timelapse_config=resolved_config,
+            start=start,
+            end=end,
+            label=label,
+        )
+
+        thread = threading.Thread(
+            target=self._run_stats_job,
+            args=(job_id,),
+            name=f"stats-job-{slug}-{mode_name}-{job_id[:8]}",
+            daemon=True,
+        )
+        job.thread = thread
+
+        with self._stats_jobs_lock:
+            self._stats_jobs[job_id] = job
+            self._stats_job_index[job_key] = job_id
+
+        thread.start()
+        return job_id
+
+    def list_stats_jobs(self) -> List[StatsGenerationJob]:
+        with self._stats_jobs_lock:
+            return list(self._stats_jobs.values())
+
     def render_timelapse_from_sessions(
         self,
         slug: str,
@@ -1014,7 +1297,7 @@ class TimelapseBackup:
                         gap_threshold,
                         seconds_per_pixel=getattr(self, "seconds_per_pixel", 30),
                     )
-                    generated_at = datetime.utcnow()
+                    generated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     report_text = build_stats_report(
                         slug=slug,
                         name=name,
@@ -1113,8 +1396,25 @@ class TimelapseBackup:
             return
 
         temp_segment_path = slug_dir / temp_segment_rel
+        temp_stats_path = temp_segment_path.with_suffix(temp_segment_path.suffix + ".stats.txt")
+        result_stats_path = (
+            render_result.output_path.with_suffix(render_result.output_path.suffix + ".stats.txt")
+            if render_result is not None
+            else None
+        )
+
+        def cleanup_temp_outputs(remove_video: bool = True) -> None:
+            """Remove temporary segment artifacts generated during rendering."""
+            if remove_video:
+                temp_segment_path.unlink(missing_ok=True)
+            paths = {temp_stats_path}
+            if result_stats_path is not None:
+                paths.add(result_stats_path)
+            for stats_path in paths:
+                stats_path.unlink(missing_ok=True)
+
         if render_result is None or render_result.frame_count == 0:
-            temp_segment_path.unlink(missing_ok=True)
+            cleanup_temp_outputs()
             self.logger.info(
                 "Skipping full timelapse update for '%s' (%s) %s %s; no frames rendered",
                 name,
@@ -1126,7 +1426,7 @@ class TimelapseBackup:
 
         encoded_sessions = list(render_result.session_dirs)
         if not encoded_sessions:
-            temp_segment_path.unlink(missing_ok=True)
+            cleanup_temp_outputs()
             self.logger.warning(
                 "Skipping full timelapse update for '%s' (%s) %s %s; no encoded sessions returned",
                 name,
@@ -1139,7 +1439,7 @@ class TimelapseBackup:
         first_dt = parse_session_datetime(encoded_sessions[0])
         last_dt = parse_session_datetime(encoded_sessions[-1])
         if first_dt is None or last_dt is None:
-            temp_segment_path.unlink(missing_ok=True)
+            cleanup_temp_outputs()
             self.logger.warning(
                 "Unable to derive session timestamps for full timelapse '%s' (%s) %s %s; skipping update",
                 name,
@@ -1156,6 +1456,7 @@ class TimelapseBackup:
         if segment_path.exists():
             segment_path.unlink()
 
+        cleanup_temp_outputs(remove_video=False)
         temp_segment_path.replace(segment_path)
         relative_segment_path = segment_path.relative_to(slug_dir)
 
@@ -1329,6 +1630,20 @@ class TimelapseBackup:
             label,
             render_result.frame_count,
         )
+
+        if getattr(self, "reporting_enabled", False) and state.segments:
+            stats_start = state.segments[0].first_datetime()
+            stats_end = state.segments[-1].last_datetime()
+            self.schedule_stats_generation(
+                slug=slug,
+                mode_name=mode_name,
+                suffix=suffix,
+                output_filename=output_filename,
+                timelapse_config=timelapse_config,
+                start=stats_start,
+                end=stats_end,
+                label=f"{label} (full)",
+            )
 
     def create_daily_timelapse(self, date: datetime = None):
         """Create timelapse videos from previous day's images for all timelapses."""

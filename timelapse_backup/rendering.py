@@ -337,6 +337,57 @@ class Renderer:
 
         return generator(), stats_collector
 
+    def collect_stats_from_manifests(
+        self,
+        manifests: Sequence[FrameManifest],
+        coordinates: Sequence[Tuple[int, int]],
+        mode_name: str,
+        slug: str,
+        name: str,
+        label: str,
+        frame_datetimes: Sequence[Optional[datetime]],
+    ) -> TimelapseStatsCollector:
+        stats_collector = TimelapseStatsCollector(list(frame_datetimes))
+        background_color = np.array(self.manifest_builder.background_color, dtype=np.uint8)
+        previous_composite: Optional[np.ndarray] = None
+
+        for index, manifest in enumerate(manifests):
+            frame_timestamp = (
+                frame_datetimes[index] if index < len(frame_datetimes) else None
+            )
+            is_historical = self._is_historical_timestamp(frame_timestamp)
+
+            composite = self.manifest_builder.compose_frame(manifest, coordinates)
+            if composite is None or composite.color is None:
+                stats_collector.record(
+                    index,
+                    None,
+                    exclude_from_timing=is_historical,
+                )
+                continue
+
+            changed_pixels: Optional[int]
+            if mode_name == "diff":
+                diff_frame, changed_pixels = self.create_differential_frame(
+                    previous_composite,
+                    composite.color,
+                    return_stats=True,
+                )
+                previous_composite = composite.color
+                if np.all(diff_frame == background_color):
+                    # Skip placeholder frames that do not introduce changes.
+                    continue
+            else:
+                changed_pixels = None
+
+            stats_collector.record(
+                index,
+                changed_pixels,
+                exclude_from_timing=is_historical,
+            )
+
+        return stats_collector
+
     def encode_with_ffmpeg(
         self,
         frame_iter: Iterator[bytes],

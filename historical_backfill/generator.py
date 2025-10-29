@@ -8,7 +8,7 @@ import json
 import logging
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -158,7 +158,7 @@ class HistoricalGenerator:
             data = {
                 "type": "placeholder",
                 "version": 2,
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             }
             with open(placeholder, "w", encoding="utf-8") as handle:
                 json.dump(data, handle)
@@ -204,7 +204,7 @@ class HistoricalGenerator:
                 data = {
                     "type": "placeholder",
                     "version": 2,
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 }
                 with open(placeholder, "w", encoding="utf-8") as handle:
                     json.dump(data, handle)
