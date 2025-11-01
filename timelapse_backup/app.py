@@ -284,6 +284,28 @@ class TimelapseBackup:
       opacity: 0.75;
       font-size: 0.95rem;
     }
+    .selection {
+      margin-top: 1rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    .selection label {
+      font-weight: 600;
+    }
+    .selection input {
+      padding: 0.35rem 0.5rem;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      background: rgba(0, 0, 0, 0.35);
+      color: #f8fbff;
+      font-size: 1rem;
+    }
+    .selection span {
+      opacity: 0.8;
+      font-size: 0.95rem;
+    }
     #preview-wrapper {
       margin-top: 1rem;
       border-radius: 12px;
@@ -293,47 +315,34 @@ class TimelapseBackup:
       display: flex;
       justify-content: center;
     }
-    #preview-wrapper img,
-    #preview-wrapper video {
+    #preview-wrapper canvas {
       max-width: 100%;
-      width: 100%;
+      height: auto;
       display: block;
-      background: var(--tile-bg);
     }
-    .tile-grid {
-      display: grid;
-      grid-template-columns: repeat(var(--grid-columns, 1), minmax(0, 1fr));
-      gap: 0;
-      background: var(--tile-bg);
-      border-radius: 8px;
-      overflow: hidden;
-    }
-    .tile-cell {
-      position: relative;
-      background: var(--tile-bg);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .tile-cell img {
+    .composite-canvas {
       width: 100%;
       height: auto;
       display: block;
       background: var(--tile-bg);
     }
-    .tile-cell.missing {
-      color: rgba(248, 251, 255, 0.7);
-      font-size: 0.9rem;
-      min-height: 40px;
+    .download {
+      margin-top: 1rem;
+      text-align: center;
     }
-    .tile-cell .tile-time {
-      position: absolute;
-      bottom: 6px;
-      right: 8px;
+    .download a {
+      display: inline-block;
+      padding: 0.5rem 1rem;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.35);
+      color: #fff;
+      text-decoration: none;
+      transition: background 0.2s ease, transform 0.2s ease;
+    }
+    .download a:hover,
+    .download a:focus {
       background: rgba(0, 0, 0, 0.55);
-      padding: 2px 6px;
-      border-radius: 6px;
-      font-size: 0.7rem;
+      transform: translateY(-1px);
     }
     ol {
       padding-left: 1.25rem;
@@ -365,9 +374,17 @@ class TimelapseBackup:
       <a id="latest-link" href="#" target="_blank" rel="noopener">Loading</a>
       <span id="latest-age" class="age"></span>
     </p>
+    <div id="datetime-wrapper" class="selection" hidden>
+      <label for="datetime-picker">Show tiles as of</label>
+      <input id="datetime-picker" type="datetime-local" autocomplete="off" />
+      <span id="selected-info"></span>
+    </div>
     <section id="preview" hidden>
       <h2>Preview</h2>
       <div id="preview-wrapper"></div>
+      <p id="download-wrapper" class="download" hidden>
+        <a id="download-composite" href="#" download>Download composite PNG</a>
+      </p>
     </section>
     <section id="recent" hidden>
       <h2>Recent files</h2>
@@ -392,6 +409,11 @@ class TimelapseBackup:
     var latestAge = document.getElementById("latest-age");
     var previewSection = document.getElementById("preview");
     var previewWrapper = document.getElementById("preview-wrapper");
+    var downloadWrapper = document.getElementById("download-wrapper");
+    var downloadLink = document.getElementById("download-composite");
+    var datetimeWrapper = document.getElementById("datetime-wrapper");
+    var datetimeInput = document.getElementById("datetime-picker");
+    var selectedInfo = document.getElementById("selected-info");
     var recentSection = document.getElementById("recent");
     var recentList = document.getElementById("recent-list");
     var listingLink = document.getElementById("listing-link");
@@ -418,6 +440,21 @@ class TimelapseBackup:
     var inferredColumns = GRID_COLUMNS > 0 ? GRID_COLUMNS : (tileRows.length && Array.isArray(tileRows[0]) ? tileRows[0].length : 0);
     if (!inferredColumns && flattenedTiles.length) {
       inferredColumns = flattenedTiles.length;
+    }
+
+    var allEntries = [];
+    var earliestEpoch = null;
+    var latestEpoch = null;
+    var renderToken = 0;
+    var datetimeHandlerAttached = false;
+
+    function hideDownload() {
+      if (downloadWrapper) {
+        downloadWrapper.hidden = true;
+      }
+      if (downloadLink) {
+        downloadLink.removeAttribute("href");
+      }
     }
 
     function resolveListingUrl() {
@@ -600,43 +637,23 @@ class TimelapseBackup:
       };
     }
 
-    function buildTileMap(entries) {
+    function buildTileMapForCutoff(entries, cutoffEpoch) {
       var map = Object.create(null);
+      var hasCutoff = typeof cutoffEpoch === "number" && !Number.isNaN(cutoffEpoch);
       entries.forEach(function (entry) {
         if (!entry || !entry.coordKey) {
           return;
         }
-        var existing = map[entry.coordKey];
-        if (!existing) {
-          map[entry.coordKey] = entry;
-          return;
+        if (hasCutoff) {
+          if (typeof entry.epoch !== "number" || Number.isNaN(entry.epoch) || entry.epoch > cutoffEpoch) {
+            return;
+          }
         }
-        if (entry.epoch && (!existing.epoch || entry.epoch > existing.epoch)) {
+        if (!map[entry.coordKey]) {
           map[entry.coordKey] = entry;
         }
       });
       return map;
-    }
-
-    function latestFromTileMap(tileMap, fallbackList) {
-      var latest = null;
-      Object.keys(tileMap).forEach(function (key) {
-        var entry = tileMap[key];
-        if (!entry) {
-          return;
-        }
-        if (!latest) {
-          latest = entry;
-          return;
-        }
-        if (entry.epoch && (!latest.epoch || entry.epoch > latest.epoch)) {
-          latest = entry;
-        }
-      });
-      if (!latest && fallbackList.length) {
-        latest = fallbackList[0];
-      }
-      return latest;
     }
 
     function describeAge(epoch) {
@@ -662,59 +679,120 @@ class TimelapseBackup:
       return "updated " + diffDays + " day" + (diffDays === 1 ? "" : "s") + " ago";
     }
 
-    function setLatest(entry) {
-      if (!entry) {
-        latestRow.hidden = true;
-        return;
-      }
-      latestLink.href = entry.url;
-      latestLink.textContent = entry.relativePath || entry.name;
-      latestAge.textContent = entry.epoch ? "(" + describeAge(entry.epoch) + ")" : "";
-      latestRow.hidden = false;
+    function loadTileImage(entry, key) {
+      return new Promise(function (resolve) {
+        var img = new Image();
+        img.crossOrigin = "anonymous";
+        img.decoding = "async";
+        img.onload = function () {
+          resolve({ key: key, entry: entry, image: img });
+        };
+        img.onerror = function () {
+          resolve(null);
+        };
+        img.src = entry.url;
+      });
     }
 
-    function renderComposite(tileMap) {
+    async function renderComposite(tileMap, cutoffEpoch) {
+      hideDownload();
       previewWrapper.innerHTML = "";
       if (!flattenedTiles.length) {
         return false;
       }
-      var grid = document.createElement("div");
-      grid.className = "tile-grid";
-      var columns = inferredColumns || 1;
-      grid.style.setProperty("--grid-columns", String(columns));
-      tileRows.forEach(function (row) {
-        if (!Array.isArray(row)) {
+      var loadPromises = [];
+      flattenedTiles.forEach(function (cell) {
+        var entry = cell && tileMap[cell.key];
+        if (!entry || entry.mediaType !== "image") {
           return;
         }
-        row.forEach(function (cell) {
-          var key = cell && (cell.key || (cell.x + "_" + cell.y));
-          var entry = key ? tileMap[key] : null;
-          var cellEl = document.createElement("div");
-          cellEl.className = "tile-cell";
-          if (entry && entry.mediaType === "image") {
-            var img = document.createElement("img");
-            img.src = entry.url;
-            img.alt = key ? ("Tile " + key) : "Tile";
-            img.loading = "lazy";
-            img.style.backgroundColor = BACKGROUND_HEX;
-            cellEl.appendChild(img);
-            if (entry.iso) {
-              var time = document.createElement("time");
-              time.dateTime = entry.iso;
-              time.textContent = new Date(entry.iso).toLocaleTimeString();
-              time.className = "tile-time";
-              cellEl.appendChild(time);
-            }
-          } else {
-            cellEl.classList.add("missing");
-            var label = document.createElement("span");
-            label.textContent = key || "missing";
-            cellEl.appendChild(label);
-          }
-          grid.appendChild(cellEl);
-        });
+        loadPromises.push(loadTileImage(entry, cell.key));
       });
-      previewWrapper.appendChild(grid);
+      if (!loadPromises.length) {
+        return false;
+      }
+      var results = await Promise.all(loadPromises);
+      var imagesByKey = Object.create(null);
+      results.forEach(function (result) {
+        if (result && result.key) {
+          imagesByKey[result.key] = result;
+        }
+      });
+      var keys = Object.keys(imagesByKey);
+      if (!keys.length) {
+        return false;
+      }
+      var sample = imagesByKey[keys[0]].image;
+      var tileWidth = sample.naturalWidth || sample.width;
+      var tileHeight = sample.naturalHeight || sample.height;
+      if (!tileWidth || !tileHeight) {
+        return false;
+      }
+      var rows = GRID_ROWS > 0 ? GRID_ROWS : (tileRows.length || Math.ceil(flattenedTiles.length / (inferredColumns || 1)) || 1);
+      var columns = GRID_COLUMNS > 0 ? GRID_COLUMNS : (tileRows.length && Array.isArray(tileRows[0]) ? tileRows[0].length : (inferredColumns || flattenedTiles.length || 1));
+      if (!columns) {
+        columns = 1;
+      }
+      var canvas = document.createElement("canvas");
+      canvas.className = "composite-canvas";
+      canvas.width = columns * tileWidth;
+      canvas.height = rows * tileHeight;
+      var ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.fillStyle = BACKGROUND_HEX || "#000000";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        if (tileRows.length) {
+          tileRows.forEach(function (row, rowIndex) {
+            if (!Array.isArray(row)) {
+              return;
+            }
+            row.forEach(function (cell, colIndex) {
+              var key = cell && (cell.key || (cell.x + "_" + cell.y));
+              var data = key ? imagesByKey[key] : null;
+              if (data && data.image) {
+                var dx = colIndex * tileWidth;
+                var dy = rowIndex * tileHeight;
+                ctx.drawImage(data.image, dx, dy, tileWidth, tileHeight);
+              }
+            });
+          });
+        } else {
+          flattenedTiles.forEach(function (cell, index) {
+            var key = cell && cell.key;
+            var data = key ? imagesByKey[key] : null;
+            if (data && data.image) {
+              var colIndex = columns ? index % columns : 0;
+              var rowIndex = columns ? Math.floor(index / columns) : 0;
+              var dx = colIndex * tileWidth;
+              var dy = rowIndex * tileHeight;
+              ctx.drawImage(data.image, dx, dy, tileWidth, tileHeight);
+            }
+          });
+        }
+      }
+      previewWrapper.appendChild(canvas);
+      if (ctx && downloadLink) {
+        try {
+          var dataUrl = canvas.toDataURL("image/png");
+          downloadLink.href = dataUrl;
+          var suffix = "latest";
+          if (typeof cutoffEpoch === "number" && !Number.isNaN(cutoffEpoch)) {
+            try {
+              var iso = new Date(cutoffEpoch).toISOString();
+              suffix = iso.replace(/[:T]/g, "-").slice(0, 16);
+            } catch (_err) {
+              suffix = String(Math.round(cutoffEpoch / 1000));
+            }
+          }
+          downloadLink.download = (TIMELAPSE_SLUG || "timelapse") + "_" + suffix + ".png";
+          if (downloadWrapper) {
+            downloadWrapper.hidden = false;
+          }
+        } catch (error) {
+          console.warn("Unable to export composite", error);
+          hideDownload();
+        }
+      }
       return true;
     }
 
@@ -742,6 +820,106 @@ class TimelapseBackup:
       recentSection.hidden = entries.length <= 1;
     }
 
+    function setLatest(entry) {
+      if (!entry) {
+        latestRow.hidden = true;
+        return;
+      }
+      latestLink.href = entry.url;
+      latestLink.textContent = entry.relativePath || entry.name;
+      latestAge.textContent = entry.epoch ? "(" + describeAge(entry.epoch) + ")" : "";
+      latestRow.hidden = false;
+    }
+
+    function toLocalInputValue(epoch) {
+      if (typeof epoch !== "number" || Number.isNaN(epoch)) {
+        return "";
+      }
+      var date = new Date(epoch);
+      var tzOffset = date.getTimezoneOffset();
+      date.setMinutes(date.getMinutes() - tzOffset);
+      return date.toISOString().slice(0, 16);
+    }
+
+    function updateSelectedInfo(epoch) {
+      if (!selectedInfo) {
+        return;
+      }
+      if (typeof epoch === "number" && !Number.isNaN(epoch)) {
+        selectedInfo.textContent = new Date(epoch).toLocaleString();
+      } else {
+        selectedInfo.textContent = "Latest available";
+      }
+    }
+
+    async function renderForCutoff(cutoffEpoch) {
+      renderToken += 1;
+      var token = renderToken;
+      var effectiveEpoch = (typeof cutoffEpoch === "number" && !Number.isNaN(cutoffEpoch))
+        ? cutoffEpoch
+        : (typeof latestEpoch === "number" && !Number.isNaN(latestEpoch) ? latestEpoch : null);
+      var tileMap = buildTileMapForCutoff(allEntries, effectiveEpoch);
+      updateStatus("Rendering selection...", false);
+      var hasComposite = await renderComposite(tileMap, effectiveEpoch);
+      if (token !== renderToken) {
+        return;
+      }
+      previewSection.hidden = !hasComposite;
+      if (!hasComposite) {
+        updateStatus("No tiles available for the selected time.", false);
+      } else {
+        updateStatus("Latest file loaded.", true);
+      }
+      updateSelectedInfo(effectiveEpoch);
+    }
+
+    function handleDatetimeChange() {
+      if (!datetimeInput) {
+        return;
+      }
+      var value = datetimeInput.value;
+      var cutoff = null;
+      if (value) {
+        var parsed = new Date(value);
+        var epoch = parsed.getTime();
+        if (!Number.isNaN(epoch)) {
+          cutoff = epoch;
+        }
+      }
+      if (cutoff === null) {
+        cutoff = latestEpoch;
+      }
+      renderForCutoff(cutoff);
+    }
+
+    function setupDatetimeControls() {
+      if (!datetimeWrapper || !datetimeInput || typeof latestEpoch !== "number" || Number.isNaN(latestEpoch) || typeof earliestEpoch !== "number" || Number.isNaN(earliestEpoch)) {
+        if (datetimeWrapper) {
+          datetimeWrapper.hidden = true;
+        }
+        return;
+      }
+      datetimeWrapper.hidden = false;
+      datetimeInput.min = toLocalInputValue(earliestEpoch);
+      datetimeInput.max = toLocalInputValue(latestEpoch);
+      datetimeInput.value = datetimeInput.max;
+      datetimeInput.step = 60;
+      if (!datetimeHandlerAttached) {
+        datetimeInput.addEventListener("change", handleDatetimeChange);
+        datetimeInput.addEventListener("input", handleDatetimeChange);
+        datetimeHandlerAttached = true;
+      }
+      updateSelectedInfo(latestEpoch);
+    }
+
+    function updateAuxiliaryLinks() {
+      if (LISTING_URL) {
+        listingLink.href = LISTING_URL;
+      } else {
+        listingLink.removeAttribute("href");
+      }
+    }
+
     function handleError(error) {
       console.error(error);
       statusEl.textContent = "Could not load the latest backup (" + error.message + ").";
@@ -749,6 +927,10 @@ class TimelapseBackup:
       latestRow.hidden = true;
       previewSection.hidden = true;
       recentSection.hidden = true;
+      hideDownload();
+      if (datetimeWrapper) {
+        datetimeWrapper.hidden = true;
+      }
       if (LISTING_URL) {
         listingLink.href = LISTING_URL;
       } else {
@@ -794,23 +976,24 @@ class TimelapseBackup:
           }
           return 0;
         });
-        var tileMap = buildTileMap(entries);
-        var latest = latestFromTileMap(tileMap, entries);
-        setLatest(latest);
-        var hasComposite = renderComposite(tileMap);
-        previewSection.hidden = !hasComposite;
+        allEntries = entries;
+        var epochEntries = entries.filter(function (entry) {
+          return typeof entry.epoch === "number" && !Number.isNaN(entry.epoch);
+        });
+        if (epochEntries.length) {
+          latestEpoch = epochEntries[0].epoch;
+          earliestEpoch = epochEntries[epochEntries.length - 1].epoch;
+        } else {
+          latestEpoch = null;
+          earliestEpoch = null;
+        }
+        setLatest(entries[0]);
         renderRecent(entries.slice(0, MAX_RECENT));
-        updateStatus("Latest file loaded.", true);
+        setupDatetimeControls();
+        var targetEpoch = latestEpoch;
+        await renderForCutoff(targetEpoch);
       } catch (error) {
         handleError(error);
-      }
-    }
-
-    function updateAuxiliaryLinks() {
-      if (LISTING_URL) {
-        listingLink.href = LISTING_URL;
-      } else {
-        listingLink.removeAttribute("href");
       }
     }
 
