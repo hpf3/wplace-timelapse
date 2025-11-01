@@ -4,6 +4,7 @@ Automatically downloads tile images every 5 minutes and creates daily timelapses
 """
 
 import os
+import json
 import logging
 import cv2
 import numpy as np
@@ -215,10 +216,14 @@ class TimelapseBackup:
         display_name: str,
         listing_url: str,
         listing_base: str,
+        tile_grid: List[List[Dict[str, Any]]],
+        grid_rows: int,
+        grid_columns: int,
     ) -> str:
         """Construct the static HTML page that points to the newest public artifact."""
         background_hex = self._background_color_hex()
         title = f"{display_name} latest backup"
+        tile_grid_json = json.dumps(tile_grid or [])
         template = Template(
             r"""<!DOCTYPE html>
 <html lang="en">
@@ -230,11 +235,12 @@ class TimelapseBackup:
     :root {
       color-scheme: dark;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --tile-bg: $background_hex;
     }
     body {
       min-height: 100vh;
       margin: 0;
-      background: $background_hex;
+      background: var(--tile-bg);
       color: #f8fbff;
       display: flex;
       align-items: center;
@@ -282,14 +288,52 @@ class TimelapseBackup:
       margin-top: 1rem;
       border-radius: 12px;
       overflow: hidden;
+      padding: 0.35rem;
+      background: var(--tile-bg);
+      display: flex;
+      justify-content: center;
     }
     #preview-wrapper img,
     #preview-wrapper video {
       max-width: 100%;
       width: 100%;
       display: block;
-      border-radius: 12px;
-      background: rgba(0, 0, 0, 0.25);
+      background: var(--tile-bg);
+    }
+    .tile-grid {
+      display: grid;
+      grid-template-columns: repeat(var(--grid-columns, 1), minmax(0, 1fr));
+      gap: 0;
+      background: var(--tile-bg);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .tile-cell {
+      position: relative;
+      background: var(--tile-bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .tile-cell img {
+      width: 100%;
+      height: auto;
+      display: block;
+      background: var(--tile-bg);
+    }
+    .tile-cell.missing {
+      color: rgba(248, 251, 255, 0.7);
+      font-size: 0.9rem;
+      min-height: 40px;
+    }
+    .tile-cell .tile-time {
+      position: absolute;
+      bottom: 6px;
+      right: 8px;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-size: 0.7rem;
     }
     ol {
       padding-left: 1.25rem;
@@ -337,6 +381,10 @@ class TimelapseBackup:
     var RAW_LISTING_URL = "$listing_url";
     var TIMELAPSE_SLUG = "$slug";
     var LISTING_BASE_HINT = "$listing_base";
+    var TILE_GRID = $tile_grid;
+    var GRID_ROWS = $grid_rows;
+    var GRID_COLUMNS = $grid_columns;
+    var BACKGROUND_HEX = "$background_hex";
     var MAX_RECENT = 5;
     var statusEl = document.getElementById("status");
     var latestRow = document.getElementById("latest-row");
@@ -348,6 +396,30 @@ class TimelapseBackup:
     var recentList = document.getElementById("recent-list");
     var listingLink = document.getElementById("listing-link");
 
+    var imageExts = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+    var videoExts = new Set(["mp4", "webm", "mov", "mkv"]);
+    var allowedExts = new Set(Array.from(imageExts).concat(Array.from(videoExts)));
+
+    var tileRows = Array.isArray(TILE_GRID) ? TILE_GRID : [];
+    var flattenedTiles = [];
+    tileRows.forEach(function (row) {
+      if (!Array.isArray(row)) {
+        return;
+      }
+      row.forEach(function (cell) {
+        if (!cell || typeof cell.x !== "number" || typeof cell.y !== "number") {
+          return;
+        }
+        var key = cell.key || (cell.x + "_" + cell.y);
+        flattenedTiles.push({ x: cell.x, y: cell.y, key: key });
+      });
+    });
+
+    var inferredColumns = GRID_COLUMNS > 0 ? GRID_COLUMNS : (tileRows.length && Array.isArray(tileRows[0]) ? tileRows[0].length : 0);
+    if (!inferredColumns && flattenedTiles.length) {
+      inferredColumns = flattenedTiles.length;
+    }
+
     function resolveListingUrl() {
       var manual = (RAW_LISTING_URL || "").trim();
       if (manual) {
@@ -358,29 +430,26 @@ class TimelapseBackup:
         return "";
       }
       var baseHint = (LISTING_BASE_HINT || "").trim();
-      var baseUrl;
       try {
-        baseUrl = baseHint ? new URL(baseHint, window.location.href) : new URL("../images/", window.location.href);
+        var baseUrl = baseHint ? new URL(baseHint, window.location.href) : new URL("../images/", window.location.href);
+        var href = baseUrl.href;
+        if (!href.endsWith("/")) {
+          href += "/";
+        }
+        return new URL(slug + "/?raw", href).href;
       } catch (_error) {
-        baseUrl = new URL(window.location.href);
+        return "";
       }
-      var baseHref = baseUrl.href;
-      if (!baseHref.endsWith("/")) {
-        baseHref += "/";
-      }
-      return new URL(slug + "/?raw", baseHref).href;
     }
 
     var LISTING_URL = resolveListingUrl();
 
-    var imageExts = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
-    var videoExts = new Set(["mp4", "webm", "mov", "mkv"]);
-    var allowedExts = new Set(Array.from(imageExts).concat(Array.from(videoExts)));
-
     var listingBaseSegments = [];
     try {
-      var listingUrlObject = new URL(LISTING_URL);
-      listingBaseSegments = listingUrlObject.pathname.split("/").filter(Boolean);
+      if (LISTING_URL) {
+        var listingUrlObject = new URL(LISTING_URL);
+        listingBaseSegments = listingUrlObject.pathname.split("/").filter(Boolean);
+      }
     } catch (error) {
       console.warn("Unable to parse listing URL", error);
     }
@@ -501,9 +570,17 @@ class TimelapseBackup:
       if (!allowedExts.has(ext)) {
         return null;
       }
-      var mediaType = imageExts.has(ext) ? "image" : (videoExts.has(ext) ? "video" : null);
-      if (!mediaType) {
-        return null;
+
+      var coordMatch = filename.match(/(\d+)_(\d+)/);
+      var coordKey = null;
+      var coordX = null;
+      var coordY = null;
+      if (coordMatch) {
+        coordX = parseInt(coordMatch[1], 10);
+        coordY = parseInt(coordMatch[2], 10);
+        if (!Number.isNaN(coordX) && !Number.isNaN(coordY)) {
+          coordKey = coordX + "_" + coordY;
+        }
       }
 
       var epochInfo = extractEpoch(pathname, decodedSegmentsFull, filename);
@@ -513,56 +590,53 @@ class TimelapseBackup:
         url: trimmed,
         name: filename,
         ext: ext,
-        mediaType: mediaType,
+        mediaType: imageExts.has(ext) ? "image" : (videoExts.has(ext) ? "video" : null),
         epoch: epochInfo.epoch,
         iso: epochInfo.iso,
-        relativePath: relativePath
+        relativePath: relativePath,
+        coordKey: coordKey,
+        coordX: coordX,
+        coordY: coordY
       };
     }
 
-    function showPreview(entry) {
-      previewWrapper.innerHTML = "";
-      if (entry.mediaType === "image") {
-        var img = document.createElement("img");
-        img.src = entry.url;
-        img.alt = "Latest backup image";
-        img.loading = "lazy";
-        previewWrapper.appendChild(img);
-        return true;
-      }
-      if (entry.mediaType === "video") {
-        var video = document.createElement("video");
-        video.controls = true;
-        video.src = entry.url;
-        video.preload = "metadata";
-        previewWrapper.appendChild(video);
-        return true;
-      }
-      return false;
+    function buildTileMap(entries) {
+      var map = Object.create(null);
+      entries.forEach(function (entry) {
+        if (!entry || !entry.coordKey) {
+          return;
+        }
+        var existing = map[entry.coordKey];
+        if (!existing) {
+          map[entry.coordKey] = entry;
+          return;
+        }
+        if (entry.epoch && (!existing.epoch || entry.epoch > existing.epoch)) {
+          map[entry.coordKey] = entry;
+        }
+      });
+      return map;
     }
 
-    function renderRecent(entries) {
-      recentList.innerHTML = "";
-      var fragment = document.createDocumentFragment();
-      entries.forEach(function (entry) {
-        var li = document.createElement("li");
-        var anchor = document.createElement("a");
-        anchor.href = entry.url;
-        anchor.textContent = entry.relativePath;
-        anchor.target = "_blank";
-        anchor.rel = "noopener";
-        li.appendChild(anchor);
-        if (entry.iso) {
-          var time = document.createElement("time");
-          time.dateTime = entry.iso;
-          time.textContent = new Date(entry.iso).toLocaleString();
-          li.appendChild(document.createTextNode(" — "));
-          li.appendChild(time);
+    function latestFromTileMap(tileMap, fallbackList) {
+      var latest = null;
+      Object.keys(tileMap).forEach(function (key) {
+        var entry = tileMap[key];
+        if (!entry) {
+          return;
         }
-        fragment.appendChild(li);
+        if (!latest) {
+          latest = entry;
+          return;
+        }
+        if (entry.epoch && (!latest.epoch || entry.epoch > latest.epoch)) {
+          latest = entry;
+        }
       });
-      recentList.appendChild(fragment);
-      recentSection.hidden = entries.length <= 1;
+      if (!latest && fallbackList.length) {
+        latest = fallbackList[0];
+      }
+      return latest;
     }
 
     function describeAge(epoch) {
@@ -589,27 +663,83 @@ class TimelapseBackup:
     }
 
     function setLatest(entry) {
+      if (!entry) {
+        latestRow.hidden = true;
+        return;
+      }
       latestLink.href = entry.url;
       latestLink.textContent = entry.relativePath || entry.name;
       latestAge.textContent = entry.epoch ? "(" + describeAge(entry.epoch) + ")" : "";
-      var hasPreview = showPreview(entry);
-      previewSection.hidden = !hasPreview;
+      latestRow.hidden = false;
     }
 
-    function splitEntries(entries) {
-      var withEpoch = [];
-      var withoutEpoch = [];
-      entries.forEach(function (entry) {
-        if (entry.epoch === null) {
-          withoutEpoch.push(entry);
-        } else {
-          withEpoch.push(entry);
+    function renderComposite(tileMap) {
+      previewWrapper.innerHTML = "";
+      if (!flattenedTiles.length) {
+        return false;
+      }
+      var grid = document.createElement("div");
+      grid.className = "tile-grid";
+      var columns = inferredColumns || 1;
+      grid.style.setProperty("--grid-columns", String(columns));
+      tileRows.forEach(function (row) {
+        if (!Array.isArray(row)) {
+          return;
         }
+        row.forEach(function (cell) {
+          var key = cell && (cell.key || (cell.x + "_" + cell.y));
+          var entry = key ? tileMap[key] : null;
+          var cellEl = document.createElement("div");
+          cellEl.className = "tile-cell";
+          if (entry && entry.mediaType === "image") {
+            var img = document.createElement("img");
+            img.src = entry.url;
+            img.alt = key ? ("Tile " + key) : "Tile";
+            img.loading = "lazy";
+            img.style.backgroundColor = BACKGROUND_HEX;
+            cellEl.appendChild(img);
+            if (entry.iso) {
+              var time = document.createElement("time");
+              time.dateTime = entry.iso;
+              time.textContent = new Date(entry.iso).toLocaleTimeString();
+              time.className = "tile-time";
+              cellEl.appendChild(time);
+            }
+          } else {
+            cellEl.classList.add("missing");
+            var label = document.createElement("span");
+            label.textContent = key || "missing";
+            cellEl.appendChild(label);
+          }
+          grid.appendChild(cellEl);
+        });
       });
-      withEpoch.sort(function (a, b) {
-        return b.epoch - a.epoch;
+      previewWrapper.appendChild(grid);
+      return true;
+    }
+
+    function renderRecent(entries) {
+      recentList.innerHTML = "";
+      var fragment = document.createDocumentFragment();
+      entries.forEach(function (entry) {
+        var li = document.createElement("li");
+        var anchor = document.createElement("a");
+        anchor.href = entry.url;
+        anchor.textContent = entry.relativePath;
+        anchor.target = "_blank";
+        anchor.rel = "noopener";
+        li.appendChild(anchor);
+        if (entry.iso) {
+          var time = document.createElement("time");
+          time.dateTime = entry.iso;
+          time.textContent = new Date(entry.iso).toLocaleString();
+          li.appendChild(document.createTextNode(" — "));
+          li.appendChild(time);
+        }
+        fragment.appendChild(li);
       });
-      return withEpoch.concat(withoutEpoch);
+      recentList.appendChild(fragment);
+      recentSection.hidden = entries.length <= 1;
     }
 
     function handleError(error) {
@@ -619,11 +749,61 @@ class TimelapseBackup:
       latestRow.hidden = true;
       previewSection.hidden = true;
       recentSection.hidden = true;
+      if (LISTING_URL) {
+        listingLink.href = LISTING_URL;
+      } else {
+        listingLink.removeAttribute("href");
+      }
     }
 
     function updateStatus(message, hidden) {
       statusEl.textContent = message;
       statusEl.hidden = hidden;
+    }
+
+    function loadListing() {
+      return fetch(LISTING_URL, { cache: "no-store" });
+    }
+
+    async function refresh() {
+      try {
+        updateStatus("Looking for the newest file...", false);
+        updateAuxiliaryLinks();
+        if (!LISTING_URL) {
+          throw new Error("Listing URL is not configured");
+        }
+        var response = await loadListing();
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status + " " + response.statusText);
+        }
+        var text = await response.text();
+        var rawEntries = text.split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean);
+        var entries = rawEntries.map(parseEntry).filter(function (entry) { return entry; });
+        if (!entries.length) {
+          throw new Error("No compatible files found");
+        }
+        entries.sort(function (a, b) {
+          if (a.epoch && b.epoch) {
+            return b.epoch - a.epoch;
+          }
+          if (a.epoch) {
+            return -1;
+          }
+          if (b.epoch) {
+            return 1;
+          }
+          return 0;
+        });
+        var tileMap = buildTileMap(entries);
+        var latest = latestFromTileMap(tileMap, entries);
+        setLatest(latest);
+        var hasComposite = renderComposite(tileMap);
+        previewSection.hidden = !hasComposite;
+        renderRecent(entries.slice(0, MAX_RECENT));
+        updateStatus("Latest file loaded.", true);
+      } catch (error) {
+        handleError(error);
+      }
     }
 
     function updateAuxiliaryLinks() {
@@ -634,35 +814,7 @@ class TimelapseBackup:
       }
     }
 
-    async function loadListing() {
-      try {
-        updateStatus("Looking for the newest file...", false);
-        updateAuxiliaryLinks();
-        if (!LISTING_URL) {
-          throw new Error("Listing URL is not configured");
-        }
-        var response = await fetch(LISTING_URL, { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error("HTTP " + response.status + " " + response.statusText);
-        }
-        var text = await response.text();
-        var rawEntries = text.split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean);
-        var entries = rawEntries.map(parseEntry).filter(Boolean);
-        if (!entries.length) {
-          throw new Error("No compatible files found");
-        }
-        var ordered = splitEntries(entries);
-        var latest = ordered[0];
-        setLatest(latest);
-        renderRecent(ordered.slice(0, MAX_RECENT));
-        updateStatus("Latest file loaded.", true);
-        latestRow.hidden = false;
-      } catch (error) {
-        handleError(error);
-      }
-    }
-
-    loadListing();
+    refresh();
   }());
   </script>
 </body>
@@ -676,19 +828,33 @@ class TimelapseBackup:
             listing_url=listing_url,
             listing_base=listing_base,
             background_hex=background_hex,
+            tile_grid=tile_grid_json,
+            grid_rows=grid_rows,
+            grid_columns=grid_columns,
         )
 
-    def _write_latest_capture_page(self, slug: str, display_name: str) -> Optional[Path]:
+    def _write_latest_capture_page(
+        self,
+        slug: str,
+        display_name: str,
+        timelapse_config: Dict[str, Any],
+    ) -> Optional[Path]:
         """Ensure the helper HTML page for a given slug is present at the backup root."""
         listing_url = self._listing_url_for_slug(slug)
         listing_base = (self.public_listing_base_url or self.DEFAULT_PUBLIC_LISTING_BASE or "").strip()
         backup_root = Path(self.backup_dir)
         page_path = backup_root / f"click_for_latest_{slug}.html"
+        tile_grid = self._tile_grid_for_timelapse(timelapse_config)
+        grid_rows = len(tile_grid)
+        grid_columns = len(tile_grid[0]) if grid_rows else 0
         html = self._build_latest_capture_page_html(
             slug,
             display_name,
             listing_url,
             listing_base,
+            tile_grid,
+            grid_rows,
+            grid_columns,
         )
         existing: Optional[str] = None
         if page_path.exists():
@@ -828,7 +994,7 @@ class TimelapseBackup:
             if not slug:
                 continue
             name = timelapse.get("name") or slug
-            page_path = self._write_latest_capture_page(slug, name)
+            page_path = self._write_latest_capture_page(slug, name, timelapse)
             if page_path is not None:
                 entries.append((slug, name, page_path.name))
         self._write_index_page(entries)
@@ -1044,6 +1210,16 @@ class TimelapseBackup:
                 coordinates.append((x, y))
         return coordinates
     
+    def _tile_grid_for_timelapse(self, timelapse_config: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+        """Return coordinates arranged by rows (y ascending) for preview rendering."""
+        coords = timelapse_config['coordinates']
+        grid: List[List[Dict[str, Any]]] = []
+        for y in range(coords['ymin'], coords['ymax'] + 1):
+            row: List[Dict[str, Any]] = []
+            for x in range(coords['xmin'], coords['xmax'] + 1):
+                row.append({"x": x, "y": y, "key": f"{x}_{y}"})
+            grid.append(row)
+        return grid
 
 
 
