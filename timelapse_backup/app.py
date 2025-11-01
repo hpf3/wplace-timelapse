@@ -16,6 +16,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from string import Template
 from typing import List, Tuple, Dict, Any, Optional, Iterable, Iterator, Union
 from dotenv import load_dotenv
 from timelapse_backup.config import (
@@ -74,6 +75,8 @@ class StatsGenerationJob:
 
 class TimelapseBackup:
     PLACEHOLDER_SUFFIX = '.placeholder'
+    DEFAULT_PUBLIC_LISTING_BASE = ""
+    PUBLIC_LISTING_ENV = "PUBLIC_LISTING_BASE_URL"
 
     def __init__(self, config_file: str = 'config.json'):
         self.config_file = config_file
@@ -88,6 +91,10 @@ class TimelapseBackup:
             'timelapses': [self._timelapse_to_dict(timelapse) for timelapse in config_data.timelapses],
             'global_settings': self._global_settings_to_dict(config_data.global_settings),
         }
+        self.public_listing_base_url = os.environ.get(
+            self.PUBLIC_LISTING_ENV,
+            self.DEFAULT_PUBLIC_LISTING_BASE,
+        )
 
         # Setup logging
         self.setup_logging()
@@ -98,6 +105,8 @@ class TimelapseBackup:
         # Create directories
         self.backup_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
+
+        self._ensure_latest_capture_pages()
 
         # Stats job tracking
         self._stats_jobs: Dict[str, StatsGenerationJob] = {}
@@ -177,6 +186,652 @@ class TimelapseBackup:
                 'coverage_gap_multiplier': settings.reporting.coverage_gap_multiplier,
             },
         }
+
+    def _background_color_rgb(self) -> Tuple[int, int, int]:
+        """Return the configured background color as an RGB tuple."""
+        color = getattr(self, "background_color", (0, 0, 0))
+        if not isinstance(color, (tuple, list)) or len(color) != 3:
+            return (0, 0, 0)
+        # Stored as BGR for OpenCV usage; convert to RGB for web output.
+        b, g, r = color
+        return (int(r), int(g), int(b))
+
+    def _background_color_hex(self) -> str:
+        """Return the configured background color as a CSS hex string."""
+        r, g, b = self._background_color_rgb()
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _listing_url_for_slug(self, slug: str) -> str:
+        """Build the remote listing URL for a timelapse slug."""
+        base_hint = (self.public_listing_base_url or self.DEFAULT_PUBLIC_LISTING_BASE or "").strip()
+        if not base_hint:
+            return ""
+        base = base_hint.rstrip("/")
+        return f"{base}/{slug}/?raw"
+
+    def _build_latest_capture_page_html(
+        self,
+        slug: str,
+        display_name: str,
+        listing_url: str,
+        listing_base: str,
+    ) -> str:
+        """Construct the static HTML page that points to the newest public artifact."""
+        background_hex = self._background_color_hex()
+        title = f"{display_name} latest backup"
+        template = Template(
+            r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>$title</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      background: $background_hex;
+      color: #f8fbff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1.5rem;
+    }
+    main {
+      width: min(720px, 100%);
+      background: rgba(0, 0, 0, 0.45);
+      border-radius: 18px;
+      padding: 2rem;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
+    }
+    h1, h2 {
+      margin-top: 0;
+      font-weight: 600;
+    }
+    a {
+      color: #ffe082;
+    }
+    a:hover,
+    a:focus {
+      color: #fff3c1;
+    }
+    .status {
+      margin-bottom: 1.5rem;
+      font-size: 1.05rem;
+    }
+    .latest {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: baseline;
+      margin-bottom: 1.5rem;
+      font-size: 1.1rem;
+    }
+    .latest .label {
+      font-weight: 600;
+    }
+    .age {
+      opacity: 0.75;
+      font-size: 0.95rem;
+    }
+    #preview-wrapper {
+      margin-top: 1rem;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    #preview-wrapper img,
+    #preview-wrapper video {
+      max-width: 100%;
+      width: 100%;
+      display: block;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.25);
+    }
+    ol {
+      padding-left: 1.25rem;
+    }
+    li + li {
+      margin-top: 0.35rem;
+    }
+    .manual {
+      margin-top: 2rem;
+      font-size: 0.95rem;
+      opacity: 0.85;
+    }
+    @media (max-width: 640px) {
+      body {
+        padding: 1.5rem 1rem;
+      }
+      main {
+        padding: 1.5rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>$heading latest backup</h1>
+    <p id="status" class="status">Looking for the newest file...</p>
+    <p class="latest" id="latest-row" hidden>
+      <span class="label">Latest:</span>
+      <a id="latest-link" href="#" target="_blank" rel="noopener">Loading</a>
+      <span id="latest-age" class="age"></span>
+    </p>
+    <section id="preview" hidden>
+      <h2>Preview</h2>
+      <div id="preview-wrapper"></div>
+    </section>
+    <section id="recent" hidden>
+      <h2>Recent files</h2>
+      <ol id="recent-list"></ol>
+    </section>
+    <p class="manual">If this page cannot load automatically, open the <a id="listing-link" href="$listing_url" target="_blank" rel="noopener">raw listing</a>.</p>
+    <noscript>This page needs JavaScript to locate the latest backup.</noscript>
+  </main>
+  <script>
+  (function () {
+    var RAW_LISTING_URL = "$listing_url";
+    var TIMELAPSE_SLUG = "$slug";
+    var LISTING_BASE_HINT = "$listing_base";
+    var MAX_RECENT = 5;
+    var statusEl = document.getElementById("status");
+    var latestRow = document.getElementById("latest-row");
+    var latestLink = document.getElementById("latest-link");
+    var latestAge = document.getElementById("latest-age");
+    var previewSection = document.getElementById("preview");
+    var previewWrapper = document.getElementById("preview-wrapper");
+    var recentSection = document.getElementById("recent");
+    var recentList = document.getElementById("recent-list");
+    var listingLink = document.getElementById("listing-link");
+
+    function resolveListingUrl() {
+      var manual = (RAW_LISTING_URL || "").trim();
+      if (manual) {
+        return manual;
+      }
+      var slug = (TIMELAPSE_SLUG || "").trim();
+      if (!slug) {
+        return "";
+      }
+      var baseHint = (LISTING_BASE_HINT || "").trim();
+      var baseUrl;
+      try {
+        baseUrl = baseHint ? new URL(baseHint, window.location.href) : new URL("../images/", window.location.href);
+      } catch (_error) {
+        baseUrl = new URL(window.location.href);
+      }
+      var baseHref = baseUrl.href;
+      if (!baseHref.endsWith("/")) {
+        baseHref += "/";
+      }
+      return new URL(slug + "/?raw", baseHref).href;
+    }
+
+    var LISTING_URL = resolveListingUrl();
+
+    var imageExts = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+    var videoExts = new Set(["mp4", "webm", "mov", "mkv"]);
+    var allowedExts = new Set(Array.from(imageExts).concat(Array.from(videoExts)));
+
+    var listingBaseSegments = [];
+    try {
+      var listingUrlObject = new URL(LISTING_URL);
+      listingBaseSegments = listingUrlObject.pathname.split("/").filter(Boolean);
+    } catch (error) {
+      console.warn("Unable to parse listing URL", error);
+    }
+
+    function decodeSegment(segment) {
+      try {
+        return decodeURIComponent(segment);
+      } catch (_error) {
+        return segment;
+      }
+    }
+
+    function normalizedSegments(segments) {
+      return segments.map(decodeSegment);
+    }
+
+    function extractEpoch(pathname, segments, filename) {
+      var isoMatch = pathname.match(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/);
+      if (isoMatch) {
+        var iso = isoMatch[1] + "-" + isoMatch[2] + "-" + isoMatch[3] + "T" + isoMatch[4] + ":" + isoMatch[5] + ":" + isoMatch[6] + "Z";
+        var parsedIso = Date.parse(iso);
+        if (!isNaN(parsedIso)) {
+          return { epoch: parsedIso, iso: iso };
+        }
+      }
+
+      var datePart = null;
+      var timePart = null;
+      for (var i = 0; i < segments.length; i++) {
+        var seg = segments[i];
+        if (!datePart && /^\d{4}-\d{2}-\d{2}$$/.test(seg)) {
+          datePart = seg;
+          var next = segments[i + 1];
+          if (!timePart && next && /^\d{2}[-:]\d{2}[-:]\d{2}$$/.test(next)) {
+            timePart = next;
+          }
+          continue;
+        }
+        if (!timePart && /^\d{2}[-:]\d{2}[-:]\d{2}$$/.test(seg)) {
+          timePart = seg;
+        }
+      }
+
+      if (datePart && !timePart) {
+        var fileMatch = filename.match(/(\d{2})[-_](\d{2})[-_](\d{2})/);
+        if (fileMatch) {
+          timePart = fileMatch[1] + "-" + fileMatch[2] + "-" + fileMatch[3];
+        }
+      }
+
+      if (datePart) {
+        var isoGuess = datePart + "T" + (timePart ? timePart.replace(/[-_]/g, ":") : "00:00:00") + "Z";
+        var parsedGuess = Date.parse(isoGuess);
+        if (!isNaN(parsedGuess)) {
+          return { epoch: parsedGuess, iso: isoGuess };
+        }
+      }
+
+      var fallback = filename.match(/(\d{4})-(\d{2})-(\d{2})(?:[T_](\d{2})[-:]?(\d{2})[-:]?(\d{2}))?/);
+      if (fallback) {
+        var fallbackIso = fallback[1] + "-" + fallback[2] + "-" + fallback[3] + "T" + (fallback[4] || "00") + ":" + (fallback[5] || "00") + ":" + (fallback[6] || "00") + "Z";
+        var parsedFallback = Date.parse(fallbackIso);
+        if (!isNaN(parsedFallback)) {
+          return { epoch: parsedFallback, iso: fallbackIso };
+        }
+      }
+
+      return { epoch: null, iso: null };
+    }
+
+    function parseEntry(raw) {
+      if (!raw) {
+        return null;
+      }
+      var trimmed = raw.trim();
+      if (!trimmed) {
+        return null;
+      }
+      var urlObject;
+      try {
+        urlObject = new URL(trimmed);
+      } catch (_error) {
+        return null;
+      }
+      var pathname = urlObject.pathname || "";
+      if (pathname.endsWith("/")) {
+        return null;
+      }
+      var segments = pathname.split("/").filter(Boolean);
+      if (!segments.length) {
+        return null;
+      }
+      var decodedSegmentsFull = normalizedSegments(segments);
+      var relativeSegments = segments.slice();
+      if (listingBaseSegments.length <= segments.length) {
+        var matchesPrefix = true;
+        for (var i = 0; i < listingBaseSegments.length; i++) {
+          if (segments[i] !== listingBaseSegments[i]) {
+            matchesPrefix = false;
+            break;
+          }
+        }
+        if (matchesPrefix) {
+          relativeSegments = segments.slice(listingBaseSegments.length);
+        }
+      }
+      var decodedRelativeSegments = normalizedSegments(relativeSegments);
+      var filename = decodedRelativeSegments.length ? decodedRelativeSegments[decodedRelativeSegments.length - 1] : (decodedSegmentsFull[decodedSegmentsFull.length - 1] || "");
+      if (!filename) {
+        return null;
+      }
+      var lower = filename.toLowerCase();
+      var dotIndex = lower.lastIndexOf(".");
+      if (dotIndex === -1) {
+        return null;
+      }
+      var ext = lower.slice(dotIndex + 1);
+      if (!allowedExts.has(ext)) {
+        return null;
+      }
+      var mediaType = imageExts.has(ext) ? "image" : (videoExts.has(ext) ? "video" : null);
+      if (!mediaType) {
+        return null;
+      }
+
+      var epochInfo = extractEpoch(pathname, decodedSegmentsFull, filename);
+      var relativePath = decodedRelativeSegments.length ? decodedRelativeSegments.join("/") : filename;
+
+      return {
+        url: trimmed,
+        name: filename,
+        ext: ext,
+        mediaType: mediaType,
+        epoch: epochInfo.epoch,
+        iso: epochInfo.iso,
+        relativePath: relativePath
+      };
+    }
+
+    function showPreview(entry) {
+      previewWrapper.innerHTML = "";
+      if (entry.mediaType === "image") {
+        var img = document.createElement("img");
+        img.src = entry.url;
+        img.alt = "Latest backup image";
+        img.loading = "lazy";
+        previewWrapper.appendChild(img);
+        return true;
+      }
+      if (entry.mediaType === "video") {
+        var video = document.createElement("video");
+        video.controls = true;
+        video.src = entry.url;
+        video.preload = "metadata";
+        previewWrapper.appendChild(video);
+        return true;
+      }
+      return false;
+    }
+
+    function renderRecent(entries) {
+      recentList.innerHTML = "";
+      var fragment = document.createDocumentFragment();
+      entries.forEach(function (entry) {
+        var li = document.createElement("li");
+        var anchor = document.createElement("a");
+        anchor.href = entry.url;
+        anchor.textContent = entry.relativePath;
+        anchor.target = "_blank";
+        anchor.rel = "noopener";
+        li.appendChild(anchor);
+        if (entry.iso) {
+          var time = document.createElement("time");
+          time.dateTime = entry.iso;
+          time.textContent = new Date(entry.iso).toLocaleString();
+          li.appendChild(document.createTextNode(" — "));
+          li.appendChild(time);
+        }
+        fragment.appendChild(li);
+      });
+      recentList.appendChild(fragment);
+      recentSection.hidden = entries.length <= 1;
+    }
+
+    function describeAge(epoch) {
+      if (!epoch) {
+        return "";
+      }
+      var diffMs = Date.now() - epoch;
+      if (diffMs < 0) {
+        diffMs = 0;
+      }
+      var diffMinutes = Math.floor(diffMs / 60000);
+      if (diffMinutes < 1) {
+        return "updated just now";
+      }
+      if (diffMinutes < 60) {
+        return "updated " + diffMinutes + " minute" + (diffMinutes === 1 ? "" : "s") + " ago";
+      }
+      var diffHours = Math.floor(diffMinutes / 60);
+      if (diffHours < 48) {
+        return "updated " + diffHours + " hour" + (diffHours === 1 ? "" : "s") + " ago";
+      }
+      var diffDays = Math.floor(diffHours / 24);
+      return "updated " + diffDays + " day" + (diffDays === 1 ? "" : "s") + " ago";
+    }
+
+    function setLatest(entry) {
+      latestLink.href = entry.url;
+      latestLink.textContent = entry.relativePath || entry.name;
+      latestAge.textContent = entry.epoch ? "(" + describeAge(entry.epoch) + ")" : "";
+      var hasPreview = showPreview(entry);
+      previewSection.hidden = !hasPreview;
+    }
+
+    function splitEntries(entries) {
+      var withEpoch = [];
+      var withoutEpoch = [];
+      entries.forEach(function (entry) {
+        if (entry.epoch === null) {
+          withoutEpoch.push(entry);
+        } else {
+          withEpoch.push(entry);
+        }
+      });
+      withEpoch.sort(function (a, b) {
+        return b.epoch - a.epoch;
+      });
+      return withEpoch.concat(withoutEpoch);
+    }
+
+    function handleError(error) {
+      console.error(error);
+      statusEl.textContent = "Could not load the latest backup (" + error.message + ").";
+      statusEl.hidden = false;
+      latestRow.hidden = true;
+      previewSection.hidden = true;
+      recentSection.hidden = true;
+    }
+
+    function updateStatus(message, hidden) {
+      statusEl.textContent = message;
+      statusEl.hidden = hidden;
+    }
+
+    function updateAuxiliaryLinks() {
+      if (LISTING_URL) {
+        listingLink.href = LISTING_URL;
+      } else {
+        listingLink.removeAttribute("href");
+      }
+    }
+
+    async function loadListing() {
+      try {
+        updateStatus("Looking for the newest file...", false);
+        updateAuxiliaryLinks();
+        if (!LISTING_URL) {
+          throw new Error("Listing URL is not configured");
+        }
+        var response = await fetch(LISTING_URL, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status + " " + response.statusText);
+        }
+        var text = await response.text();
+        var rawEntries = text.split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean);
+        var entries = rawEntries.map(parseEntry).filter(Boolean);
+        if (!entries.length) {
+          throw new Error("No compatible files found");
+        }
+        var ordered = splitEntries(entries);
+        var latest = ordered[0];
+        setLatest(latest);
+        renderRecent(ordered.slice(0, MAX_RECENT));
+        updateStatus("Latest file loaded.", true);
+        latestRow.hidden = false;
+      } catch (error) {
+        handleError(error);
+      }
+    }
+
+    loadListing();
+  }());
+  </script>
+</body>
+</html>
+"""
+        )
+        return template.substitute(
+            title=title,
+            heading=display_name,
+            slug=slug,
+            listing_url=listing_url,
+            listing_base=listing_base,
+            background_hex=background_hex,
+        )
+
+    def _write_latest_capture_page(self, slug: str, display_name: str) -> Optional[Path]:
+        """Ensure the helper HTML page for a given slug is present at the backup root."""
+        listing_url = self._listing_url_for_slug(slug)
+        listing_base = (self.public_listing_base_url or self.DEFAULT_PUBLIC_LISTING_BASE or "").strip()
+        backup_root = Path(self.backup_dir)
+        page_path = backup_root / f"click_for_latest_{slug}.html"
+        html = self._build_latest_capture_page_html(
+            slug,
+            display_name,
+            listing_url,
+            listing_base,
+        )
+        existing: Optional[str] = None
+        if page_path.exists():
+            try:
+                existing = page_path.read_text(encoding="utf-8")
+            except Exception:
+                existing = None
+        if existing == html:
+            return page_path
+        try:
+            page_path.write_text(html, encoding="utf-8")
+        except Exception as error:
+            self.logger.warning(
+                "Unable to write latest page for '%s': %s",
+                slug,
+                error,
+            )
+            return None
+
+        legacy_page = backup_root / slug / "click_for_latest_image.html"
+        if legacy_page.exists() and legacy_page.is_file():
+            try:
+                legacy_page.unlink()
+            except Exception as error:
+                self.logger.debug(
+                    "Unable to remove legacy latest page for '%s': %s",
+                    slug,
+                    error,
+                )
+        return page_path
+
+    def _build_index_page_html(
+        self,
+        entries: List[Tuple[str, str, str]],
+    ) -> str:
+        """Build an index page linking to each helper page."""
+        background_hex = self._background_color_hex()
+        title = "Latest backup index"
+        if entries:
+            list_items = "\n".join(
+                f'      <li><a href="{filename}" rel="noopener">{display_name}</a></li>'
+                for _, display_name, filename in entries
+            )
+        else:
+            list_items = "      <li>No timelapses configured.</li>"
+        return (
+            "<!DOCTYPE html>\n"
+            "<html lang=\"en\">\n"
+            "<head>\n"
+            "  <meta charset=\"utf-8\" />\n"
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n"
+            f"  <title>{title}</title>\n"
+            "  <style>\n"
+            "    body {\n"
+            "      min-height: 100vh;\n"
+            "      margin: 0;\n"
+            f"      background: {background_hex};\n"
+            "      color: #f8fbff;\n"
+            "      display: flex;\n"
+            "      align-items: center;\n"
+            "      justify-content: center;\n"
+            "      font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n"
+            "      padding: 2rem 1.5rem;\n"
+            "    }\n"
+            "    main {\n"
+            "      width: min(540px, 100%);\n"
+            "      background: rgba(0, 0, 0, 0.45);\n"
+            "      border-radius: 18px;\n"
+            "      padding: 2rem;\n"
+            "      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);\n"
+            "    }\n"
+            "    h1 {\n"
+            "      margin-top: 0;\n"
+            "      font-weight: 600;\n"
+            "    }\n"
+            "    ul {\n"
+            "      list-style: none;\n"
+            "      padding: 0;\n"
+            "      margin: 1.5rem 0 0;\n"
+            "      display: grid;\n"
+            "      gap: 0.75rem;\n"
+            "    }\n"
+            "    a {\n"
+            "      color: #ffe082;\n"
+            "      font-size: 1.05rem;\n"
+            "      text-decoration: none;\n"
+            "    }\n"
+            "    a:hover,\n"
+            "    a:focus {\n"
+            "      color: #fff3c1;\n"
+            "      text-decoration: underline;\n"
+            "    }\n"
+            "    @media (max-width: 640px) {\n"
+            "      body {\n"
+            "        padding: 1.5rem 1rem;\n"
+            "      }\n"
+            "      main {\n"
+            "        padding: 1.5rem;\n"
+            "      }\n"
+            "    }\n"
+            "  </style>\n"
+            "</head>\n"
+            "<body>\n"
+            "  <main>\n"
+            f"    <h1>{title}</h1>\n"
+            "    <p>Select a timelapse to jump to the latest capture helper page.</p>\n"
+            "    <ul>\n"
+            f"{list_items}\n"
+            "    </ul>\n"
+            "  </main>\n"
+            "</body>\n"
+            "</html>\n"
+        )
+
+    def _write_index_page(self, entries: List[Tuple[str, str, str]]) -> None:
+        """Write the top-level index pointing to each helper page."""
+        index_path = Path(self.backup_dir) / "click_for_latest_image.html"
+        html = self._build_index_page_html(entries)
+        existing: Optional[str] = None
+        if index_path.exists():
+            try:
+                existing = index_path.read_text(encoding="utf-8")
+            except Exception:
+                existing = None
+        if existing == html:
+            return
+        try:
+            index_path.write_text(html, encoding="utf-8")
+        except Exception as error:
+            self.logger.warning("Unable to write index helper page: %s", error)
+
+    def _ensure_latest_capture_pages(self) -> None:
+        """Generate helper pages at the backup root and an index page."""
+        entries: List[Tuple[str, str, str]] = []
+        for timelapse in self.config.get("timelapses", []):
+            slug = timelapse.get("slug")
+            if not slug:
+                continue
+            name = timelapse.get("name") or slug
+            page_path = self._write_latest_capture_page(slug, name)
+            if page_path is not None:
+                entries.append((slug, name, page_path.name))
+        self._write_index_page(entries)
 
     def _parse_background_color(self, value: Any) -> Tuple[int, int, int]:
         """Backward-compatible wrapper for the background color parser."""
