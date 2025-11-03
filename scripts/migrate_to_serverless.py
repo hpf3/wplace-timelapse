@@ -790,7 +790,7 @@ def main() -> None:
     config = load_timelapse_config(args.config)
     backup_root = Path(args.backup_root) if args.backup_root else Path(config.global_settings.backup_dir)
 
-    slug_map: Dict[str, TimelapseConfig] = {cfg.slug: cfg for cfg in config.timelapses if cfg.enabled}
+    slug_map: Dict[str, TimelapseConfig] = {cfg.slug: cfg for cfg in config.timelapses if True}
     requested_slugs = args.slug or list(slug_map.keys())
     missing_slugs = [slug for slug in requested_slugs if slug not in slug_map]
     if missing_slugs:
